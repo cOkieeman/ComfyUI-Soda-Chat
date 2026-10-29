@@ -1,0 +1,508 @@
+.soda-chat-host {
+  height: 100%;
+  overflow: hidden;
+}
+
+.soda-chat {
+  --sc-bg: var(--comfy-menu-bg, #202020);
+  --sc-panel: var(--comfy-menu-secondary-bg, var(--comfy-input-bg, #2a2a2a));
+  --sc-input: var(--comfy-input-bg, #2a2a2a);
+  --sc-text: var(--input-text, var(--fg-color, #ddd));
+  --sc-muted: var(--descrip-text, #999);
+  --sc-border: var(--border-color, #444);
+  --sc-accent: var(--p-primary-color, #3b82f6);
+  --sc-accent-text: var(--p-primary-contrast-color, #fff);
+  --sc-danger: var(--error-text, #e5534b);
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: 100%;
+  padding: 8px;
+  color: var(--sc-text);
+  background: var(--sc-bg);
+  font-size: 13px;
+  line-height: 1.5;
+  overflow: hidden;
+  position: relative;
+}
+
+.soda-chat *,
+.soda-chat *::before,
+.soda-chat *::after {
+  box-sizing: border-box;
+}
+
+.soda-chat h4 {
+  margin: 12px 0 4px;
+  font-size: 13px;
+}
+
+.sc-tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--sc-border);
+  flex: none;
+}
+
+.sc-tab {
+  flex: 1;
+  padding: 6px 0;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: none;
+  color: var(--sc-muted);
+  cursor: pointer;
+  font: inherit;
+}
+
+.sc-tab.sc-active {
+  color: var(--sc-text);
+  border-bottom-color: var(--sc-accent);
+}
+
+.sc-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.sc-between {
+  justify-content: space-between;
+  flex-wrap: nowrap;
+}
+
+.sc-chat {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1;
+  min-height: 0;
+}
+
+.sc-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-right: 2px;
+}
+
+.sc-select,
+.sc-field,
+.sc-input,
+.sc-prompt {
+  width: 100%;
+  min-width: 0;
+  padding: 5px 7px;
+  border: 1px solid var(--sc-border);
+  border-radius: 6px;
+  background: var(--sc-input);
+  color: var(--sc-text);
+  font: inherit;
+}
+
+.sc-row > .sc-select {
+  flex: 1 1 120px;
+  width: auto;
+}
+
+.sc-input,
+.sc-prompt {
+  resize: vertical;
+}
+
+.sc-prompt {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12px;
+}
+
+.sc-btn {
+  padding: 4px 10px;
+  border: 1px solid var(--sc-border);
+  border-radius: 6px;
+  background: var(--sc-panel);
+  color: var(--sc-text);
+  cursor: pointer;
+  font: inherit;
+  white-space: nowrap;
+}
+
+.sc-btn:hover:not(:disabled) {
+  border-color: var(--sc-accent);
+}
+
+.sc-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.sc-primary {
+  background: var(--sc-accent);
+  border-color: var(--sc-accent);
+  color: var(--sc-accent-text);
+}
+
+.sc-danger {
+  color: var(--sc-danger);
+}
+
+.sc-primary.sc-danger {
+  color: var(--sc-accent-text);
+}
+
+.sc-wide {
+  width: 100%;
+}
+
+.sc-icon,
+.sc-link {
+  border: 0;
+  background: none;
+  color: var(--sc-muted);
+  cursor: pointer;
+  font: inherit;
+  padding: 0 4px;
+}
+
+.sc-link {
+  color: var(--sc-text);
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.sc-title {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.sc-muted {
+  color: var(--sc-muted);
+  font-size: 12px;
+}
+
+.sc-messages {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-right: 2px;
+}
+
+.sc-empty {
+  margin: auto 0;
+  padding: 16px 8px;
+  color: var(--sc-muted);
+  text-align: center;
+}
+
+.sc-msg {
+  padding: 8px;
+  border-radius: 8px;
+  overflow-wrap: anywhere;
+}
+
+.sc-user {
+  align-self: flex-end;
+  max-width: 90%;
+  background: var(--sc-panel);
+}
+
+.sc-assistant {
+  border: 1px solid var(--sc-border);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.sc-meta {
+  color: var(--sc-muted);
+  font-size: 11px;
+}
+
+.sc-text,
+.sc-pre {
+  white-space: pre-wrap;
+}
+
+.sc-pre {
+  max-height: 320px;
+  overflow: auto;
+  padding: 6px;
+  border-radius: 6px;
+  background: var(--sc-input);
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12px;
+}
+
+.sc-live {
+  max-height: 240px;
+  overflow: auto;
+  color: var(--sc-muted);
+}
+
+.sc-error {
+  color: var(--sc-danger);
+}
+
+.sc-warnings {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--sc-muted);
+  font-size: 12px;
+}
+
+.sc-fold > summary {
+  cursor: pointer;
+  color: var(--sc-muted);
+  font-size: 12px;
+}
+
+.sc-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--sc-border);
+  border-radius: 8px;
+  background: var(--sc-bg);
+}
+
+details.sc-card > summary {
+  cursor: pointer;
+}
+
+.sc-incomplete {
+  border-style: dashed;
+}
+
+.sc-card-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+  align-items: baseline;
+}
+
+.sc-card-title {
+  font-weight: 600;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.sc-badge {
+  flex: none;
+  padding: 0 6px;
+  border-radius: 10px;
+  background: var(--sc-panel);
+  color: var(--sc-muted);
+  font-size: 11px;
+}
+
+.sc-actions {
+  justify-content: flex-end;
+}
+
+.sc-call code {
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.sc-composer {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border-top: 1px solid var(--sc-border);
+  padding-top: 6px;
+}
+
+.sc-notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--sc-accent);
+  border-radius: 8px;
+}
+
+.sc-notice > span {
+  flex: 1 1 160px;
+}
+
+.sc-history {
+  flex: none;
+  max-height: 40%;
+  overflow-y: auto;
+  border: 1px solid var(--sc-border);
+  border-radius: 8px;
+  padding: 4px;
+}
+
+.sc-history-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+
+.sc-history-item.sc-active,
+.sc-list-item.sc-active {
+  background: var(--sc-panel);
+}
+
+.sc-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sc-list-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: none;
+  color: var(--sc-text);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.sc-list-item:hover {
+  border-color: var(--sc-border);
+}
+
+.sc-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border-top: 1px solid var(--sc-border);
+  padding-top: 8px;
+}
+
+.sc-vars {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sc-var {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+  color: var(--sc-muted);
+}
+
+.sc-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.sc-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(90px, 1fr));
+  gap: 6px;
+}
+
+.sc-entry {
+  border: 1px solid var(--sc-border);
+  border-radius: 6px;
+  padding: 4px 6px;
+}
+
+.sc-entry > summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.sc-entry > summary::-webkit-details-marker {
+  display: none;
+}
+
+.sc-entry .sc-pre {
+  margin-top: 4px;
+}
+
+.sc-off .sc-entry-name {
+  color: var(--sc-muted);
+  text-decoration: line-through;
+}
+
+.sc-entry-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sc-role {
+  flex: none;
+  padding: 0 5px;
+  border-radius: 4px;
+  font-size: 11px;
+  background: var(--sc-panel);
+}
+
+.sc-role-system {
+  color: #d9a441;
+}
+
+.sc-role-assistant {
+  color: #5bb98c;
+}
+
+.sc-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  padding: 8px;
+  background: rgb(0 0 0 / 45%);
+}
+
+.sc-dialog {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  padding: 10px;
+  border: 1px solid var(--sc-border);
+  border-radius: 8px;
+  background: var(--sc-bg);
+  overflow: hidden;
+}
+
+.sc-dialog-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
