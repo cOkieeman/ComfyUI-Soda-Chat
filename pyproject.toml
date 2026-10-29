@@ -1,0 +1,44 @@
+[project]
+name = "comfyui-soda-chat"
+version = "0.1.0"
+description = "Chat with an LLM in the ComfyUI sidebar, write image prompts with st-chatu8 style presets, then fill a node and queue the workflow in one click."
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/cOkieeman/ComfyUI-Soda-Chat"
+
+[tool.comfy]
+PublisherId = "cokieeman"
+DisplayName = "Soda Chat"
+Icon = ""
+includes = []
+
+[dependency-groups]
+dev = ["pytest>=8.0", "ruff>=0.9", "aiohttp>=3.9"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+exclude = [".venv", ".test-tmp", ".tmp"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = ["COM812", "CPY001", "D", "ISC001"]
+
+[tool.ruff.lint.per-file-ignores]
+# ComfyUI loads the repository folder (whose public name contains hyphens) as a package.
+"**/__init__.py" = ["N999"]
+# JSON boundaries accept heterogeneous values; user-facing diagnostics are Chinese.
+"soda_chat/*.py" = ["ANN401", "EM101", "EM102", "TRY003", "RUF001", "RUF002", "RUF003"]
+# Names and positional signatures are prescribed by the ComfyUI node API.
+"nodes.py" = ["N802", "ARG002", "RUF001"]
+# Dynamic PromptServer/aiohttp boundary.
+"routes.py" = ["ANN401", "EM101", "EM102", "TRY003", "RUF001", "PLR0911", "BLE001"]
+# Assertions, fixed numbers and Chinese strings are test expectations.
+"tests/*.py" = ["S101", "S105", "INP001", "PLR2004", "RUF001", "ANN401", "SLF001"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --confcutdir=tests --basetemp=.test-tmp"

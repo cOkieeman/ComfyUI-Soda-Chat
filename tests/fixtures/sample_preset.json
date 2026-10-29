@@ -1,0 +1,110 @@
+{
+  "样例预设": {
+    "entries": [
+      {
+        "id": "e1",
+        "name": "配置",
+        "role": "system",
+        "content": "{@setvar::张数::2@}{@setvar::语气::温和@}{{roll 100}}{{roll 100}}\n你是画面助手，语气{@getvar::语气@}。",
+        "enabled": true,
+        "triggerMode": "always",
+        "triggerWords": "",
+        "andTriggerWords": ""
+      },
+      {
+        "id": "e2",
+        "name": "覆盖张数",
+        "role": "system",
+        "content": "{@setvar::张数::3@}每次给 {@getvar::张数@} 张图。{{未知宏}}",
+        "enabled": true,
+        "triggerMode": "always",
+        "triggerWords": "",
+        "andTriggerWords": ""
+      },
+      {
+        "id": "e3",
+        "name": "停用条目",
+        "role": "system",
+        "content": "{@setvar::张数::9@}这条不应发送。",
+        "enabled": false,
+        "triggerMode": "always",
+        "triggerWords": "",
+        "andTriggerWords": ""
+      },
+      {
+        "id": "e4",
+        "name": "雨天补充",
+        "role": "system",
+        "content": "画面里有雨时，写出雨丝和湿润的地面。",
+        "enabled": true,
+        "triggerMode": "keyword",
+        "triggerWords": "雨天，下雨",
+        "andTriggerWords": ""
+      },
+      {
+        "id": "e5",
+        "name": "夜景加街道",
+        "role": "system",
+        "content": "夜晚街道要写路灯。",
+        "enabled": true,
+        "triggerMode": "keyword",
+        "triggerWords": "",
+        "andTriggerWords": "夜晚、街道"
+      },
+      {
+        "id": "e6",
+        "name": "角色列表",
+        "role": "user",
+        "content": "可用角色：\n{{角色启用列表}}\n模板：\n{{通用角色启用列表}}\n设定：{{世界书触发}}\n之前：{{上下文}}",
+        "enabled": true,
+        "triggerMode": "always",
+        "triggerWords": "",
+        "andTriggerWords": ""
+      },
+      {
+        "id": "e7",
+        "name": "确认",
+        "role": "assistant",
+        "content": "好的，{{user}}。",
+        "enabled": true,
+        "triggerMode": "always",
+        "triggerWords": "",
+        "andTriggerWords": ""
+      },
+      {
+        "id": "e8",
+        "name": "空条目",
+        "role": "user",
+        "content": "   ",
+        "enabled": true,
+        "triggerMode": "always",
+        "triggerWords": "",
+        "andTriggerWords": ""
+      },
+      {
+        "id": "e9",
+        "name": "本轮",
+        "role": "user",
+        "content": "正文：{{正文}}\n需求：{{用户需求}}\n变量缺失：[{@getvar::不存在@}]",
+        "enabled": true,
+        "triggerMode": "always",
+        "triggerWords": "",
+        "andTriggerWords": ""
+      }
+    ]
+  },
+  "第二个预设": {
+    "entries": [
+      {
+        "id": "x1",
+        "name": "唯一条目",
+        "role": "narrator",
+        "content": "{{char}} 在这里。",
+        "enabled": true,
+        "triggerMode": "always",
+        "triggerWords": "",
+        "andTriggerWords": ""
+      }
+    ]
+  }
+}
