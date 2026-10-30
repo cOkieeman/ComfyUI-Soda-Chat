@@ -114,7 +114,11 @@ async def scenario(plugin: ModuleType, root: Path, fail: int = 0) -> dict[str, A
 
 def test_full_chat_flow(plugin: ModuleType, tmp_path: Path) -> None:
     out = asyncio.run(scenario(plugin, tmp_path))
-    assert [p["name"] for p in out["state"]["presets"]] == ["Soda 默认 · MOSS 单图"]
+    assert [p["name"] for p in out["state"]["presets"]] == [
+        "Soda 默认 · Anima 单图",
+        "Soda 默认 · Krea2 结构化",
+        "Soda 默认 · MOSS 单图",
+    ]
     assert SECRET not in json.dumps(out["saved"])
     assert out["preview"]["report"]["removed_macros"] == {"roll": 2, "未知宏": 1}
     assert out["first_status"] == 200

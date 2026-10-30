@@ -151,19 +151,41 @@ def test_builtin_presets_are_seeded_once(tmp_path: Path) -> None:
     assert store.list() == []
 
 
-def test_bundled_default_preset_renders_cleanly() -> None:
+@pytest.mark.parametrize(
+    ("filename", "model", "expected_variables"),
+    [
+        ("soda-moss-basic.json", "MOSS-Image", {"生图数量": "1"}),
+        ("soda-anima-basic.json", "Anima", {"生图数量": "1"}),
+        ("soda-krea2-basic.json", "Krea2", {"生图数量": "1", "画风开头": "Anime-style illustration"}),
+    ],
+)
+def test_bundled_presets_render_cleanly(filename: str, model: str, expected_variables: dict) -> None:
     from conftest import ROOT  # noqa: PLC0415
 
-    text = (ROOT / "presets_builtin" / "soda-moss-basic.json").read_text(encoding="utf-8")
+    text = (ROOT / "presets_builtin" / filename).read_text(encoding="utf-8")
     presets, warnings = parse_file(text)
     assert warnings == []
     preset = {**presets[0], "id": "b", "overrides": {}}
     messages, report = render_messages(preset, {**PLACEHOLDERS, "素材": ""}, "")
     assert report["removed_macros"] == {}
     assert report["missing_variables"] == []
-    assert report["variables"] == {"生图数量": "1"}
+    assert report["variables"] == expected_variables
+    assert f"{model} 文生图提示词" in messages[0]["content"]
+    assert "{@" not in json.dumps(messages, ensure_ascii=False)
     assert messages[-1]["role"] == "user"
     assert "画一个撑伞的人" in messages[-1]["content"]
+
+
+def test_bundled_krea2_style_opening_can_be_overridden() -> None:
+    from conftest import ROOT  # noqa: PLC0415
+
+    presets, _ = parse_file((ROOT / "presets_builtin" / "soda-krea2-basic.json").read_text(encoding="utf-8"))
+    preset = {**presets[0], "id": "k", "overrides": {"画风开头": "Photorealistic photo"}}
+    messages, report = render_messages(preset, {**PLACEHOLDERS, "素材": ""}, "")
+    rules = json.dumps(messages, ensure_ascii=False)
+    assert report["variables"]["画风开头"] == "Photorealistic photo"
+    assert "Photorealistic photo, [Tags]" in rules
+    assert "Anime-style illustration" not in rules
 
 
 def test_variables_from_disabled_entries_are_fallbacks() -> None:
