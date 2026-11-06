@@ -8,6 +8,7 @@
 
 - **侧边栏聊天**：选预设和模型服务，流式显示回复，可以中途停止。对话记录保存在本机，可以回看和继续。
 - **图片卡片**：回复里的每张图显示成一张卡片，有标题、尺寸和可修改的提示词。按钮「填入」「填入并出图」，多张图时还有「全部依次出图」。
+- **看图修改**：选择当前工作流或最近生成的图片，附上修改要求，交给支持看图的模型继续写提示词；历史对话中的图片可以再次选用。
 - **「Soda Chat 提示词」节点**：输出 `prompt`、`width`、`height`，接进任意工作流。
 - **预设管理**：导入 st-chatu8 预设 JSON，逐条开关条目，修改 `{@setvar@}` 变量；可以预览实际发给模型的全部消息。
 - **角色库**：支持预设里的 `${...}$` 角色调用，按正面 / 背面和穿着状态拼出外貌描述。
@@ -22,7 +23,7 @@
 git clone https://github.com/cOkieeman/ComfyUI-Soda-Chat.git
 ```
 
-重启 ComfyUI 并刷新网页，左侧栏会出现「Soda Chat」（对话气泡图标）。不需要 `pip install`：只用 Python 标准库和 ComfyUI 自带的 aiohttp。
+重启 ComfyUI 并刷新网页，左侧栏会出现「Soda Chat」（对话气泡图标）。不需要额外 `pip install`：使用 Python 标准库及 ComfyUI 自带的 aiohttp、Pillow。
 
 ## 第一次使用
 
@@ -33,9 +34,21 @@ git clone https://github.com/cOkieeman/ComfyUI-Soda-Chat.git
 
 `example_workflows/soda-chat-demo.json` 是不需要任何模型的演示工作流：节点的三个输出接到文字预览，用来确认填入和排队都正常。
 
+### 根据生成图继续修改
+
+1. 先用工作流出图，在聊天输入区点「选择生成图」，选择要讨论的图片，再点「完成选择」。列表包含当前工作流和最近 20 次任务中的 PNG、JPEG、WebP。
+2. 使用支持图片输入的 OpenAI 兼容模型，写清希望保留和修改的部分，例如「保留配色和背景，把人物放大并移到左侧」，再发送。
+3. 查看新的提示词卡片，必要时手动修改，再点「填入并出图」。手动改过的卡片内容会进入后续聊天上下文。
+
+每轮最多附 4 张图。选中的图片会随每轮消息发送，直到你点「移除」；可以在「预览发送内容」中核对。历史记录不会自动重发图片，需要时点「继续用这张图」。
+
+图片会在本机保存去除工作流、EXIF 等元数据的 JPEG 副本，长边最多 2048 像素；原图不变。支持不超过 20 MB、4000 万像素的原图。附件只用于模型观察和修改提示词，不会自动接入工作流的图生图输入。移除选图或删除对话目前不会自动清理附件副本。
+
 ### 多个节点
 
 画布上有多个「Soda Chat 提示词」节点时，在节点的 `label` 里填上名字，再到「设置 → 目标节点 label」填同一个名字。留空就填第一个找到的节点。子图里的节点也能找到。
+
+目标节点或父子图处于静音 / 绕过状态时会提示先启用对应模式。排队失败会显示错误，批量出图也会在失败处停止。
 
 ## 预设格式
 
@@ -86,7 +99,7 @@ Soda Chat 按名字或别名在角色库里查找，拼接「基础外貌 + 上�
 
 ## 密钥与安全
 
-- 配置和数据都在 `ComfyUI/user/soda_chat/`：`services.json`（含 API Key）、`presets/`、`characters.json`、`sessions/`、`settings.json`。
+- 配置和数据都在 `ComfyUI/user/soda_chat/`：`services.json`（含 API Key）、`presets/`、`characters.json`、`sessions/`、`attachments/`、`settings.json`。附件副本保留在本机，原始输出被移动后仍可用于续聊。
 - API Key 只在服务端读取，接口不会返回，也不会写进节点、工作流、出图 PNG 或对话记录。修改服务地址时必须重新填写 Key，避免把旧 Key 发到新地址。
 - 公网服务地址必须是 https；本机和局域网地址允许 http。
 - Soda Chat 的接口只接受本机同源请求。用 `--listen` 从其他设备访问 ComfyUI 时，侧边栏会被拒绝。
@@ -94,7 +107,7 @@ Soda Chat 按名字或别名在角色库里查找，拼接「基础外貌 + 上�
 ## 已知限制
 
 - 只支持 OpenAI 兼容的 `chat/completions`，不支持原生 Anthropic Messages 或 Gemini generateContent 地址。
-- 暂不能把出好的图发回给模型看。
+- 看图需要服务和模型支持 OpenAI `image_url` 内容块；普通文本模型仍可用于不附图的聊天。
 - 负面提示词不经过 Soda Chat，请在工作流里自己设置。
 
 ## 开发
@@ -102,7 +115,16 @@ Soda Chat 按名字或别名在角色库里查找，拼接「基础外貌 + 上�
 ```sh
 uv run pytest
 uv run ruff check .
+node --test tests/frontend.test.mjs tests/frontend-service.test.mjs
 ```
+
+浏览器布局回归使用已安装的 Playwright 和 Chromium / Edge，所有接口均由测试模拟，不调用模型或修改实际数据：
+
+```sh
+node --test tests/frontend-dom.test.mjs
+```
+
+如果 Playwright 不在项目的模块搜索路径中，将环境变量 `PLAYWRIGHT_PACKAGE_JSON` 设为现有 Playwright 的 `package.json` 绝对路径。需要指定浏览器时设置 `PLAYWRIGHT_EXECUTABLE_PATH`。
 
 ## 许可证
 

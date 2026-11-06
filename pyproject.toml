@@ -16,7 +16,12 @@ Icon = ""
 includes = []
 
 [dependency-groups]
-dev = ["pytest>=8.0", "ruff>=0.9", "aiohttp>=3.9"]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.9",
+    "aiohttp>=3.9",
+    "pillow>=10.0",
+]
 
 [tool.ruff]
 line-length = 110

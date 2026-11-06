@@ -4,6 +4,7 @@ import { api } from "../../scripts/api.js";
 const NODE_TYPE = "SodaChatPrompt";
 const TAB_ID = "soda-chat";
 const LS = "soda-chat:";
+const MAX_IMAGES = 4;
 const ROLE_LABEL = { system: "系统", user: "用户", assistant: "助手" };
 const SIDES = { front: "正面", back: "背面" };
 const FIELDS = {
@@ -18,6 +19,10 @@ const FIELDS = {
 
 function h(tag, props = {}, ...children) {
   const el = document.createElement(tag);
+  if (tag === "button") {
+    el.type = "button";
+    el.dataset.uiKey = props["aria-label"] || props.title || props.text || "button";
+  } else if (tag === "summary") el.dataset.uiKey = "summary";
   for (const [key, value] of Object.entries(props ?? {})) {
     if (value === undefined || value === null || value === false) continue;
     if (key === "class") el.className = value;
@@ -106,6 +111,11 @@ function shortTime(iso) {
   return Number.isNaN(date.getTime()) ? "" : date.toLocaleString(undefined, { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
 }
 
+function savedAttachments() {
+  const images = load("attachments", []);
+  return Array.isArray(images) ? images.filter((image) => image && typeof image.id === "string" && typeof image.url === "string").slice(0, MAX_IMAGES) : [];
+}
+
 // ---- state -----------------------------------------------------------------------------------------------
 
 const S = {
@@ -114,7 +124,11 @@ const S = {
   tab: load("tab", "chat"),
   presets: [],
   services: { active: "", profiles: [] },
+  serviceSwitchSerial: 0,
+  serviceSwitchPending: null,
+  serviceSwitchError: "",
   settings: {},
+  settingsDraft: {},
   sessions: [],
   session: null,
   presetId: load("preset", ""),
@@ -122,7 +136,12 @@ const S = {
   material: load("material", ""),
   setting: load("setting", ""),
   streaming: null,
+  sending: false,
+  filling: false,
+  attachments: savedAttachments(),
+  imagePicker: null,
   presetDetail: null,
+  presetVariableDrafts: new Map(),
   characters: null,
   serviceForm: null,
   modelOptions: [],
@@ -149,6 +168,9 @@ async function init() {
 }
 
 function setSession(session) {
+  // A newly started stream acquires its server ID without becoming a different view.
+  const root = S.host?.querySelector('.soda-chat[data-ui-view="chat:new"]');
+  if (S.streaming && !S.session && session && root) root.dataset.uiView = `chat:${session.id}`;
   S.session = session;
   save("session", session?.id ?? "");
 }
@@ -158,14 +180,16 @@ function setSession(session) {
 function graphNodes() {
   const root = app.rootGraph ?? app.graph;
   const found = [];
-  const visit = (graph) => {
-    for (const node of graph?.nodes ?? []) {
-      if ((node.comfyClass ?? node.type) === NODE_TYPE && !found.includes(node)) found.push(node);
+  const visit = (graph, inactive = false, ancestors = new Set()) => {
+    if (!graph || ancestors.has(graph)) return;
+    const path = new Set(ancestors).add(graph);
+    for (const node of graph.nodes ?? graph._nodes ?? []) {
+      const disabled = inactive || node.mode === 2 || node.mode === 4;
+      if ((node.comfyClass ?? node.type) === NODE_TYPE) found.push({ node, inactive: disabled });
+      if (node.subgraph) visit(node.subgraph, disabled, path);
     }
   };
   visit(root);
-  const subgraphs = root?.subgraphs;
-  if (subgraphs?.values) for (const graph of subgraphs.values()) visit(graph);
   return found;
 }
 
@@ -188,19 +212,28 @@ function setWidget(node, name, value) {
 function targetNode() {
   const nodes = graphNodes();
   const label = (S.settings.target_label || "").trim();
-  if (label) return nodes.find((n) => widget(n, "label")?.value === label) ?? null;
+  if (label) return nodes.find(({ node }) => widget(node, "label")?.value === label) ?? null;
   return nodes[0] ?? null;
 }
 
 async function fill(image, queue) {
-  const node = targetNode();
-  if (!node) {
+  const target = targetNode();
+  if (!target) {
     S.noNode = true;
     render();
     toast("画布上没有可填入的「Soda Chat 提示词」节点", "warn");
     return false;
   }
-  setWidget(node, "prompt", image.prompt);
+  const { node, inactive } = target;
+  if (inactive) {
+    toast("目标节点或所在子图已静音 / 绕过，请先启用对应的 Soda Chat 模式", "warn");
+    return false;
+  }
+  if (queue && app.processingQueue) {
+    toast("ComfyUI 正在提交其他任务，请稍后再点「填入并出图」", "warn");
+    return false;
+  }
+  if (!setWidget(node, "prompt", image.prompt)) throw new Error("目标节点缺少 prompt 输入，请重新添加 Soda Chat 提示词节点");
   if (S.settings.use_ai_size && image.size) {
     setWidget(node, "width", image.size.width);
     setWidget(node, "height", image.size.height);
@@ -208,7 +241,11 @@ async function fill(image, queue) {
   node.setDirtyCanvas?.(true, true);
   app.graph?.setDirtyCanvas?.(true, true);
   if (queue) {
-    await app.queuePrompt(0, 1);
+    const queued = await app.queuePrompt(0, 1);
+    if (queued === false) {
+      toast("提示词已填入，但出图未成功提交。请查看 ComfyUI 的报错或队列状态", "warn");
+      return false;
+    }
     toast("已填入并排队出图", "success");
   } else {
     toast("已填入节点", "success");
@@ -216,9 +253,18 @@ async function fill(image, queue) {
   return true;
 }
 
-async function fillAll(images) {
-  for (const image of images) {
-    if (!(await fill(image, true))) return;
+async function fillCards(images, queue) {
+  if (S.filling) return;
+  S.filling = true;
+  render();
+  try {
+    await flushPromptEdits();
+    for (const image of images) {
+      if (!(await fill(image, queue))) return;
+    }
+  } finally {
+    S.filling = false;
+    render();
   }
 }
 
@@ -240,28 +286,172 @@ function addNode() {
   toast("已添加节点，把它的输出接到工作流里", "success");
 }
 
+// ---- image attachments -----------------------------------------------------------------------------------
+
+function localURL(path) {
+  return api.apiURL ? api.apiURL(path) : path;
+}
+
+function imageRefKey(ref) {
+  return JSON.stringify([ref.type || "output", ref.subfolder || "", ref.filename]);
+}
+
+function outputImageURL(ref) {
+  return localURL(`/view?${new URLSearchParams({ filename: ref.filename, subfolder: ref.subfolder || "", type: ref.type || "output" })}`);
+}
+
+function rememberAttachments() {
+  save("attachments", S.attachments);
+}
+
+function reuseAttachment(attachment) {
+  if (S.streaming || S.sending) return;
+  if (S.attachments.some((item) => item.id === attachment.id)) return;
+  if (S.attachments.length >= MAX_IMAGES) throw new Error(`每轮最多发送 ${MAX_IMAGES} 张图，请先移除一张`);
+  S.attachments.push(attachment);
+  rememberAttachments();
+  render();
+}
+
+function removeAttachment(id) {
+  if (S.streaming || S.sending) return;
+  S.attachments = S.attachments.filter((item) => item.id !== id);
+  rememberAttachments();
+  render();
+}
+
+async function chooseOutput(ref) {
+  const picker = S.imagePicker;
+  if (!picker || picker.busy || S.streaming || S.sending) return;
+  if (S.attachments.length >= MAX_IMAGES) throw new Error(`每轮最多发送 ${MAX_IMAGES} 张图，请先移除一张`);
+  picker.busy = true;
+  picker.error = "";
+  render();
+  try {
+    const { attachment } = await call("attachments/from-output", { method: "POST", body: ref });
+    reuseAttachment(attachment);
+    picker.selected.add(imageRefKey(ref));
+  } catch (error) {
+    picker.error = error.message || String(error);
+  } finally {
+    picker.busy = false;
+    render();
+  }
+}
+
+async function openImagePicker() {
+  if (S.streaming || S.sending) return;
+  const images = [];
+  const previous = S.imagePicker;
+  const picker = { images: previous?.images ?? images, loading: true, busy: false, error: "", selected: new Set(previous?.selected) };
+  S.imagePicker = picker;
+  const seen = new Set();
+  const collect = (outputs, source) => {
+    for (const output of Object.values(outputs ?? {})) {
+      for (const image of output?.images ?? []) {
+        if (!image || typeof image.filename !== "string" || !/\.(png|jpe?g|webp)$/i.test(image.filename)) continue;
+        if (image.type && !["output", "temp"].includes(image.type)) continue;
+        const ref = { filename: image.filename, subfolder: image.subfolder || "", type: image.type || "output" };
+        const key = imageRefKey(ref);
+        if (seen.has(key) || images.length >= 120) continue;
+        seen.add(key);
+        images.push({ ref, source });
+      }
+    }
+  };
+  collect(app.nodeOutputs, "当前工作流");
+  render();
+  try {
+    const res = await api.fetchApi("/history?max_items=20");
+    if (!res.ok) throw new Error(`历史图片读取失败（${res.status}）`);
+    const history = await res.json();
+    for (const run of Object.values(history).reverse()) collect(run?.outputs, "最近生成");
+  } catch (error) {
+    picker.error = error.message || String(error);
+  } finally {
+    picker.images = images;
+    picker.loading = false;
+    if (S.imagePicker === picker) render();
+  }
+}
+
+function attachmentThumb(attachment) {
+  return h("img", { class: "sc-attachment-img", src: localURL(attachment.url), alt: attachment.name || "附带图片", loading: "lazy" });
+}
+
+function attachmentList(images, mode = "history") {
+  if (!images?.length) return null;
+  return h("div", { class: "sc-attachments", "data-ui-key": `attachments:${mode}` }, images.map((attachment) => h(
+    "div", { class: "sc-attachment", "data-ui-key": attachment.id },
+    h("a", { href: localURL(attachment.url), target: "_blank", rel: "noopener", title: "查看图片" }, attachmentThumb(attachment)),
+    h("div", { class: "sc-attachment-info" },
+      h("span", { class: "sc-attachment-name", text: attachment.name || "图片", title: attachment.name || "图片" }),
+      h("span", { class: "sc-meta", text: `${attachment.width}×${attachment.height}` }),
+      mode === "selected"
+        ? h("button", { class: "sc-link", text: "移除", title: `移除 ${attachment.name || "图片"}`, disabled: Boolean(S.streaming || S.sending), on: { click: () => removeAttachment(attachment.id) } })
+        : h("button", { class: "sc-link", text: S.attachments.some((item) => item.id === attachment.id) ? "已选中" : "继续用这张图", disabled: Boolean(S.streaming || S.sending) || S.attachments.some((item) => item.id === attachment.id), on: { click: guard(() => reuseAttachment(attachment)) } }),
+    ),
+  )));
+}
+
+function imagePickerOverlay() {
+  const picker = S.imagePicker;
+  const close = () => { if (!picker.busy) { S.imagePicker = null; render(); } };
+  return h("div", { class: "sc-overlay", on: { keydown: (e) => { if (e.key === "Escape") { e.stopPropagation(); close(); } } } },
+    h("div", { class: "sc-dialog", "data-ui-key": "image-picker", role: "dialog", "aria-label": "选择生成图", "aria-modal": "true" },
+      h("div", { class: "sc-row sc-between" }, h("strong", { text: "选择生成图" }), h("button", { class: "sc-icon", text: "×", title: "关闭图片选择", disabled: picker.busy, on: { click: close } })),
+      h("div", { class: "sc-muted", text: `从当前工作流和最近 20 次生成中选择，最多 ${MAX_IMAGES} 张。已选 ${S.attachments.length} 张。` }),
+      h("div", { class: "sc-row" }, h("button", { class: "sc-btn", text: picker.loading ? "读取中…" : "刷新图片", disabled: picker.loading || picker.busy, on: { click: guard(openImagePicker) } })),
+      picker.error ? h("div", { class: "sc-error", text: picker.error }) : null,
+      h("div", { class: "sc-dialog-body", "data-ui-key": "body" },
+        !picker.images.length && !picker.loading ? h("div", { class: "sc-empty", text: "还没有可选择的生成图。先用工作流出图，再点「刷新图片」。支持 PNG、JPEG 和 WebP。" }) : null,
+        h("div", { class: "sc-image-grid" }, picker.images.map(({ ref, source }) => {
+          const selected = picker.selected.has(imageRefKey(ref));
+          return h("button", { class: `sc-output-image${selected ? " sc-selected" : ""}`, title: `${source} · ${ref.subfolder ? `${ref.subfolder}/` : ""}${ref.filename}`, "aria-label": `选择图片 ${ref.filename}`, disabled: picker.busy || selected || S.attachments.length >= MAX_IMAGES, on: { click: guard(() => chooseOutput(ref)) } },
+            h("img", { src: outputImageURL(ref), alt: ref.filename, loading: "lazy" }),
+            h("span", { class: "sc-attachment-name", text: ref.filename }),
+            h("span", { class: "sc-meta", text: selected ? "已选中" : source }),
+          );
+        })),
+      ),
+      h("button", { class: "sc-btn sc-primary", text: "完成选择", disabled: picker.busy, on: { click: close } }),
+    ),
+  );
+}
+
 // ---- chat ------------------------------------------------------------------------------------------------
 
 async function readEvents(res, onEvent) {
+  if (!res.body) throw new Error("模型服务没有返回可读取的回复流");
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    let cut;
-    while ((cut = buffer.indexOf("\n\n")) >= 0) {
-      const chunk = buffer.slice(0, cut);
-      buffer = buffer.slice(cut + 2);
-      let event = "message";
-      let data = "";
-      for (const line of chunk.split("\n")) {
-        if (line.startsWith("event:")) event = line.slice(6).trim();
-        else if (line.startsWith("data:")) data += line.slice(5).trim();
-      }
-      if (data) onEvent(event, JSON.parse(data));
+  const emit = (chunk) => {
+    let event = "message";
+    const data = [];
+    for (const line of chunk.split("\n")) {
+      if (line.startsWith("event:")) event = line.slice(6).trim();
+      else if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
     }
+    if (data.length) onEvent(event, JSON.parse(data.join("\n")));
+  };
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
+      buffer = buffer.replace(/\r\n/g, "\n");
+      let cut;
+      while ((cut = buffer.indexOf("\n\n")) >= 0) {
+        emit(buffer.slice(0, cut));
+        buffer = buffer.slice(cut + 2);
+      }
+      if (done) {
+        if (buffer.trim()) emit(buffer);
+        break;
+      }
+    }
+  } finally {
+    reader.releaseLock();
   }
 }
 
@@ -273,11 +463,13 @@ function turnRequest() {
     input: S.draft,
     material: S.material,
     setting: S.setting,
+    image_ids: S.attachments.map((image) => image.id),
   };
 }
 
 function checkReady() {
   if (!S.presetId) throw new Error("请先在「预设」页导入或选择预设");
+  if (S.serviceSwitchError) throw new Error(S.serviceSwitchError);
   if (!S.services.active) {
     S.tab = "settings";
     render();
@@ -285,18 +477,49 @@ function checkReady() {
   }
 }
 
-async function sendMessage() {
-  if (S.streaming) return;
-  if (!S.draft.trim() && !S.material.trim()) return;
+async function ensureServiceReady() {
+  while (S.serviceSwitchPending) {
+    try {
+      await S.serviceSwitchPending;
+    } catch {
+      // A newer selection may already be queued; only the latest failure blocks sending.
+    }
+  }
   checkReady();
+}
+
+async function sendMessage() {
+  if (S.streaming || S.sending) return;
+  if (!S.draft.trim() && !S.material.trim()) {
+    if (S.attachments.length) throw new Error("已选好图片，请写下希望模型观察或修改的内容");
+    return;
+  }
+  checkReady();
+  S.sending = true;
+  try {
+    await flushPromptEdits();
+    await ensureServiceReady();
+  } catch (error) {
+    S.sending = false;
+    render();
+    throw error;
+  }
   const body = turnRequest();
   const controller = new AbortController();
-  S.streaming = { controller, user: body.input, text: "", reasoning: "", report: null };
+  const previousIds = new Set((S.session?.turns ?? []).map((turn) => turn.id));
+  S.streaming = { controller, user: body.input, material: body.material, images: [...S.attachments], text: "", reasoning: "", report: null, turnId: "" };
   S.stickBottom = true;
   S.draft = "";
   save("draft", "");
   render();
   let finished = null;
+  let receivedTerminal = false;
+  let recovery = false;
+  const restoreDraft = () => {
+    if (!body.input || S.draft === body.input || S.draft.startsWith(`${body.input}\n\n`)) return;
+    S.draft = S.draft ? `${body.input}\n\n${S.draft}` : body.input;
+    save("draft", S.draft);
+  };
   try {
     const res = await api.fetchApi("/soda_chat/chat", {
       method: "POST",
@@ -311,26 +534,62 @@ async function sendMessage() {
     await readEvents(res, (event, data) => {
       if (event === "start") {
         S.streaming.report = data.report;
+        S.streaming.turnId = data.turn_id || "";
         if (!S.session || S.session.id !== data.session_id) setSession({ id: data.session_id, title: data.title, turns: [] });
       } else if (event === "delta") {
         S.streaming[data.kind === "reasoning" ? "reasoning" : "text"] += data.text;
         updateStreaming();
       } else if (event === "done" || event === "error") {
-        finished = data.turn;
-        if (event === "error") toast(data.error, "error");
+        receivedTerminal = true;
+        if (data.session_deleted) {
+          setSession(null);
+          finished = null;
+        } else {
+          finished = data.turn;
+        }
+        if (event === "error") {
+          restoreDraft();
+          toast(data.error || "模型回复失败，已保留本轮输入", "error");
+        }
       }
     });
+    if (!receivedTerminal) throw new Error("回复连接提前结束，已保留收到的内容和本轮输入，可以重试");
   } catch (error) {
-    if (error.name === "AbortError") {
-      finished = { id: `local-${Date.now()}`, user: body.input, reply: S.streaming.text, status: "interrupted", parsed: null, report: S.streaming.report };
-    } else {
-      S.draft = body.input;
-      toast(error.message, "error");
+    if (!finished) {
+      recovery = true;
+      S.streaming.recovering = true;
+      restoreDraft();
+      finished = {
+        id: `local-${Date.now()}`, user: body.input, material: body.material, images: S.streaming.images,
+        reply: S.streaming.text, reasoning: S.streaming.reasoning, status: "interrupted", parsed: null,
+        report: S.streaming.report, error: error.name === "AbortError" ? "已停止，本轮输入已保留" : error.message,
+      };
+      if (error.name !== "AbortError") toast(error.message, "error");
+      render();
     }
   } finally {
-    if (finished && S.session) S.session.turns.push(finished);
+    if (S.session && recovery) {
+      // The server persists a stopped turn after the upstream stream closes. Wait briefly for its exact ID.
+      for (const delay of [0, 200, 500, 1000, 1500, 2000]) {
+        if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+        try {
+          const saved = await call(`sessions/${S.session.id}`);
+          const canonical = saved.turns.find((turn) => S.streaming.turnId
+            ? turn.id === S.streaming.turnId
+            : !previousIds.has(turn.id) && turn.user === body.input);
+          if (canonical) {
+            setSession(saved);
+            finished = null;
+            break;
+          }
+        } catch {
+          /* A brand-new session may not be on disk until the interrupted turn is saved. */
+        }
+      }
+    }
+    if (finished && S.session && !S.session.turns.some((turn) => turn.id === finished.id)) S.session.turns.push(finished);
     S.streaming = null;
-    S.stickBottom = true;
+    S.sending = false;
     try {
       S.sessions = (await call("sessions")).sessions;
     } catch {
@@ -341,45 +600,79 @@ async function sendMessage() {
 }
 
 function stopMessage() {
+  if (S.streaming) S.streaming.stopping = true;
   S.streaming?.controller.abort();
+  render();
 }
 
 async function openPreview() {
   checkReady();
+  await flushPromptEdits();
+  await ensureServiceReady();
   S.preview = await call("preview", { method: "POST", body: turnRequest() });
   render();
 }
 
 async function newSession() {
-  if (S.streaming) return;
+  if (S.streaming || S.sending) return;
+  await flushPromptEdits();
   setSession(null);
+  S.stickBottom = true;
   S.showHistory = false;
   render();
 }
 
 async function openSession(id) {
-  if (S.streaming) return;
+  if (S.streaming || S.sending) return;
+  await flushPromptEdits();
   setSession(await call(`sessions/${id}`));
   S.showHistory = false;
   render();
 }
 
 async function deleteSession(id) {
+  if (S.streaming || S.sending) throw new Error("请先等待当前回复完成，或停止回复后再删除对话");
+  await flushPromptEdits();
   if (!confirm("删除这段对话记录？")) return;
   S.sessions = (await call(`sessions/${id}`, { method: "DELETE" })).sessions;
   if (S.session?.id === id) setSession(null);
   render();
 }
 
-let promptTimer = null;
+const promptEdits = new Map();
+const promptWrites = new Map();
+
+function persistPromptEdit(key, edit) {
+  clearTimeout(edit.timer);
+  if (edit.promise) return edit.promise;
+  const previous = promptWrites.get(key) ?? Promise.resolve();
+  const job = previous.catch(() => {}).then(() => call(`sessions/${edit.sessionId}/prompt`, { method: "PATCH", body: edit.body })).then(() => {
+    if (promptEdits.get(key) === edit) promptEdits.delete(key);
+  }).catch((error) => {
+    edit.promise = null;
+    throw new Error(`提示词修改未保存：${error.message}。请保持当前页面后重试。`);
+  }).finally(() => {
+    if (promptWrites.get(key) === job) promptWrites.delete(key);
+  });
+  edit.promise = job;
+  promptWrites.set(key, job);
+  return job;
+}
+
+async function flushPromptEdits() {
+  await Promise.all([...promptEdits].map(([key, edit]) => persistPromptEdit(key, edit)));
+  await Promise.all(promptWrites.values());
+}
+
 function rememberPrompt(turn, image, value) {
   image.prompt = value;
   if (!S.session || String(turn.id).startsWith("local-")) return;
-  clearTimeout(promptTimer);
   const sessionId = S.session.id;
-  promptTimer = setTimeout(() => {
-    call(`sessions/${sessionId}/prompt`, { method: "PATCH", body: { turn_id: turn.id, index: image.index, prompt: value } }).catch(() => {});
-  }, 600);
+  const key = `${sessionId}/${turn.id}/${image.index}`;
+  clearTimeout(promptEdits.get(key)?.timer);
+  const edit = { sessionId, body: { turn_id: turn.id, index: image.index, prompt: value }, timer: null, promise: null };
+  edit.timer = setTimeout(() => persistPromptEdit(key, edit).catch((error) => toast(error.message, "error")), 600);
+  promptEdits.set(key, edit);
 }
 
 // ---- rendering: chat -------------------------------------------------------------------------------------
@@ -390,6 +683,7 @@ function presetSelect() {
     {
       class: "sc-select",
       title: "预设",
+      "data-ui-key": "preset-select",
       on: {
         change: guard(async (e) => {
           S.presetId = e.target.value;
@@ -403,16 +697,38 @@ function presetSelect() {
   );
 }
 
+function selectService(serviceId) {
+  const serial = ++S.serviceSwitchSerial;
+  const previous = S.serviceSwitchPending ?? Promise.resolve();
+  S.services = { ...S.services, active: serviceId };
+  S.serviceSwitchError = "";
+  const pending = previous.catch(() => {}).then(async () => {
+    const services = await call(`services/${serviceId}/activate`, { method: "POST", body: {} });
+    if (serial === S.serviceSwitchSerial) S.services = services;
+  }).catch((error) => {
+    if (serial !== S.serviceSwitchSerial) return;
+    S.serviceSwitchError = `模型服务切换失败：${error.message}。请重新选择服务后重试。`;
+    throw new Error(S.serviceSwitchError);
+  }).finally(() => {
+    if (serial === S.serviceSwitchSerial) {
+      S.serviceSwitchPending = null;
+      render();
+    }
+  });
+  S.serviceSwitchPending = pending;
+  render();
+  return pending;
+}
+
 function serviceSelect() {
   return h(
     "select",
     {
       class: "sc-select",
       title: "模型服务",
+      "data-ui-key": "service-select",
       on: {
-        change: guard(async (e) => {
-          S.services = await call(`services/${e.target.value}/activate`, { method: "POST", body: {} });
-        }),
+        change: guard((e) => selectService(e.target.value)),
       },
     },
     S.services.profiles.length ? null : h("option", { value: "", text: "（没有模型服务）" }),
@@ -429,21 +745,23 @@ function imageCard(turn, image) {
   const size = image.size ? `${image.size.width}×${image.size.height}` : image.size_raw ? `尺寸无效：${image.size_raw}` : "未给尺寸";
   const textarea = h("textarea", {
     class: "sc-prompt",
+    "data-ui-key": "prompt",
     value: image.prompt,
     rows: 8,
     spellcheck: false,
+    disabled: Boolean(S.streaming || S.sending),
     on: { input: (e) => rememberPrompt(turn, image, e.target.value) },
   });
   return h(
     "div",
-    { class: `sc-card${image.incomplete ? " sc-incomplete" : ""}` },
+    { class: `sc-card${image.incomplete ? " sc-incomplete" : ""}`, "data-ui-key": `image:${image.index}` },
     h("div", { class: "sc-card-head" }, h("span", { class: "sc-card-title", text: image.title || `图 ${image.index + 1}` }), h("span", { class: "sc-badge", text: size })),
-    image.think ? h("details", { class: "sc-fold" }, h("summary", { text: "画面思考" }), h("div", { class: "sc-pre", text: image.think })) : null,
+    image.think ? h("details", { class: "sc-fold", "data-ui-key": "image-thought" }, h("summary", { text: "画面思考" }), h("div", { class: "sc-pre", "data-ui-key": "content", text: image.think })) : null,
     textarea,
     image.calls?.length
       ? h(
           "details",
-          { class: "sc-fold" },
+          { class: "sc-fold", "data-ui-key": "character-calls" },
           h("summary", { text: `角色调用（${image.calls.length}）` }),
           image.calls.map((c) => h("div", { class: "sc-call" }, h("code", { text: c.raw }), h("div", { text: c.found ? `→ ${c.result || "（字段为空）"}` : `→ 未找到，保留「${c.result}」` }))),
         )
@@ -452,8 +770,8 @@ function imageCard(turn, image) {
     h(
       "div",
       { class: "sc-row sc-actions" },
-      h("button", { class: "sc-btn", text: "填入", on: { click: guard(() => fill(image, false)) } }),
-      h("button", { class: "sc-btn sc-primary", text: "填入并出图", on: { click: guard(() => fill(image, true)) } }),
+      h("button", { class: "sc-btn", text: "填入", disabled: S.filling, on: { click: guard(() => fillCards([image], false)) } }),
+      h("button", { class: "sc-btn sc-primary", text: "填入并出图", disabled: S.filling, on: { click: guard(() => fillCards([image], true)) } }),
     ),
   );
 }
@@ -465,30 +783,31 @@ function assistantBlock(turn) {
   const images = parsed?.images ?? [];
   return h(
     "div",
-    { class: "sc-msg sc-assistant" },
+    { class: "sc-msg sc-assistant", "data-ui-key": `assistant:${turn.id}` },
     h("div", { class: "sc-meta", text: [turn.preset_name, turn.model, status].filter(Boolean).join(" · ") }),
     turn.error ? h("div", { class: "sc-error", text: turn.error }) : null,
-    turn.report?.warnings?.length ? h("details", { class: "sc-fold sc-muted" }, h("summary", { text: `提示（${turn.report.warnings.length}）` }), warningList(turn.report.warnings)) : null,
-    thoughts.length ? h("details", { class: "sc-fold" }, h("summary", { text: "思考过程" }), h("div", { class: "sc-pre", text: thoughts.join("\n\n") })) : null,
+    turn.report?.warnings?.length ? h("details", { class: "sc-fold sc-muted", "data-ui-key": "warnings" }, h("summary", { text: `提示（${turn.report.warnings.length}）` }), warningList(turn.report.warnings)) : null,
+    thoughts.length ? h("details", { class: "sc-fold", "data-ui-key": "thoughts" }, h("summary", { text: "思考过程" }), h("div", { class: "sc-pre", "data-ui-key": "content", text: thoughts.join("\n\n") })) : null,
     parsed ? (parsed.text ? h("div", { class: "sc-text", text: parsed.text }) : null) : h("div", { class: "sc-text", text: turn.reply || "" }),
     images.map((image) => imageCard(turn, image)),
-    images.length > 1 ? h("button", { class: "sc-btn sc-wide", text: `全部依次出图（${images.length} 张）`, on: { click: guard(() => fillAll(images)) } }) : null,
+    images.length > 1 ? h("button", { class: "sc-btn sc-wide", text: `全部依次出图（${images.length} 张）`, disabled: S.filling, on: { click: guard(() => fillCards(images, true)) } }) : null,
   );
 }
 
-function userBlock(text, material) {
+function userBlock(text, material, images, id) {
   return h(
     "div",
-    { class: "sc-msg sc-user" },
+    { class: "sc-msg sc-user", "data-ui-key": `user:${id}` },
     text ? h("div", { class: "sc-text", text }) : null,
     material ? h("div", { class: "sc-meta", text: `附带素材 ${material.length} 字` }) : null,
+    attachmentList(images),
   );
 }
 
 function streamingBlock() {
   const s = S.streaming;
-  const body = h("div", { class: "sc-text sc-live" });
-  const block = h("div", { class: "sc-msg sc-assistant" }, h("div", { class: "sc-meta", text: "生成中…" }), body);
+  const body = h("div", { class: "sc-text sc-live", "data-ui-key": "response" });
+  const block = h("div", { class: "sc-msg sc-assistant", "data-ui-key": "streaming" }, h("div", { class: "sc-meta", text: s.stopping || s.recovering ? "正在保存已收到的回复…" : "生成中…" }), body);
   s.el = body;
   updateStreaming();
   return block;
@@ -497,23 +816,26 @@ function streamingBlock() {
 function updateStreaming() {
   const s = S.streaming;
   if (!s?.el) return;
-  s.el.textContent = s.text || (s.reasoning ? `（思考中，已收到 ${s.reasoning.length} 字）` : "（等待模型回复）");
   const list = s.el.closest(".sc-messages");
-  if (list && list.scrollHeight - list.scrollTop - list.clientHeight < 160) list.scrollTop = list.scrollHeight;
+  const follow = list && list.scrollHeight - list.scrollTop - list.clientHeight < 160;
+  const followText = s.el.scrollHeight - s.el.scrollTop - s.el.clientHeight < 80;
+  s.el.textContent = s.text || (s.reasoning ? `（思考中，已收到 ${s.reasoning.length} 字）` : "（等待模型回复）");
+  if (follow && followText) s.el.scrollTop = s.el.scrollHeight;
+  if (follow) list.scrollTop = list.scrollHeight;
 }
 
 function historyPanel() {
   return h(
     "div",
-    { class: "sc-history" },
+    { class: "sc-history", "data-ui-key": "history" },
     S.sessions.length ? null : h("div", { class: "sc-muted", text: "还没有对话记录" }),
     S.sessions.map((s) =>
       h(
         "div",
-        { class: `sc-history-item${S.session?.id === s.id ? " sc-active" : ""}` },
+        { class: `sc-history-item${S.session?.id === s.id ? " sc-active" : ""}`, "data-ui-key": s.id },
         h("button", { class: "sc-link", text: s.title, title: s.title, on: { click: guard(() => openSession(s.id)) } }),
         h("span", { class: "sc-muted", text: `${s.turns} 轮 · ${shortTime(s.updated)}` }),
-        h("button", { class: "sc-icon", text: "×", title: "删除", on: { click: guard(() => deleteSession(s.id)) } }),
+        h("button", { class: "sc-icon", text: "×", title: "删除", disabled: Boolean(S.streaming || S.sending), on: { click: guard(() => deleteSession(s.id)) } }),
       ),
     ),
   );
@@ -538,8 +860,18 @@ function previewOverlay() {
         : null,
       h(
         "div",
-        { class: "sc-dialog-body" },
-        p.messages.map((m, i) => h("details", { class: "sc-fold", open: i === p.messages.length - 1 }, h("summary", { text: `${i + 1}. ${ROLE_LABEL[m.role] ?? m.role} · ${m.content.length} 字` }), h("div", { class: "sc-pre", text: m.content }))),
+        { class: "sc-dialog-body", "data-ui-key": "preview-body" },
+        p.messages.map((m, i) => {
+          const parts = typeof m.content === "string" ? [{ type: "text", text: m.content }] : (m.content ?? []);
+          const length = parts.reduce((sum, part) => sum + (part.type === "text" ? (part.text || "").length : 0), 0);
+          const count = parts.filter((part) => part.type === "image_url").length;
+          return h("details", { class: "sc-fold", "data-ui-key": `message:${i}`, open: i === p.messages.length - 1 },
+            h("summary", { text: `${i + 1}. ${ROLE_LABEL[m.role] ?? m.role} · ${length} 字${count ? ` · ${count} 张图` : ""}` }),
+            parts.map((part, partIndex) => part.type === "image_url"
+              ? h("img", { class: "sc-preview-image", src: localURL(part.image_url.url), alt: "将发送给模型的图片", loading: "lazy" })
+              : h("div", { class: "sc-pre", "data-ui-key": `content:${partIndex}`, text: part.text || "" })),
+          );
+        }),
       ),
     ),
   );
@@ -548,8 +880,9 @@ function previewOverlay() {
 function composer() {
   const input = h("textarea", {
     class: "sc-input",
+    "data-ui-key": "draft",
     rows: 3,
-    placeholder: "说说想画什么…（Ctrl+Enter 发送）",
+    placeholder: S.attachments.length ? "告诉模型这张图哪里要保留、哪里要修改…（Ctrl+Enter 发送）" : "说说想画什么…（Ctrl+Enter 发送）",
     value: S.draft,
     on: {
       input: (e) => {
@@ -567,10 +900,11 @@ function composer() {
   const area = (key, label, hint) =>
     h(
       "details",
-      { class: "sc-fold", open: Boolean(S[key]) },
+      { class: "sc-fold", "data-ui-key": key, open: Boolean(S[key]) },
       h("summary", { text: S[key] ? `${label}（${S[key].length} 字）` : label }),
       h("textarea", {
         class: "sc-input",
+        "data-ui-key": "text",
         rows: 4,
         placeholder: hint,
         value: S[key],
@@ -584,36 +918,36 @@ function composer() {
     );
   return h(
     "div",
-    { class: "sc-composer" },
+    { class: "sc-composer", "data-ui-key": "composer" },
     area("material", "素材", "可选：贴一段剧情或画面描述，对应预设里的 {{正文}}"),
     area("setting", "设定", "可选：世界观、固定设定，对应预设里的 {{世界书触发}}"),
+    h("div", { class: "sc-row" },
+      h("button", { class: "sc-btn", text: "选择生成图", disabled: Boolean(S.streaming || S.sending) || S.attachments.length >= MAX_IMAGES, on: { click: guard(openImagePicker) } }),
+      h("span", { class: "sc-muted", text: S.attachments.length ? `${S.attachments.length}/${MAX_IMAGES} 张 · 需使用支持看图的模型` : "可选 · 把生成图发给看图模型继续修改" }),
+    ),
+    attachmentList(S.attachments, "selected"),
+    S.attachments.length ? h("div", { class: "sc-muted sc-image-notice", text: "选中的图片会随每轮消息发送，直到你移除它们。" }) : null,
     input,
     h(
       "div",
       { class: "sc-row sc-between" },
-      h("button", { class: "sc-btn", text: "预览发送内容", disabled: Boolean(S.streaming), on: { click: guard(openPreview) } }),
+      h("button", { class: "sc-btn", text: "预览发送内容", disabled: Boolean(S.streaming || S.sending), on: { click: guard(openPreview) } }),
       S.streaming
-        ? h("button", { class: "sc-btn sc-danger", text: "停止", on: { click: stopMessage } })
-        : h("button", { class: "sc-btn sc-primary", text: "发送", on: { click: guard(sendMessage) } }),
+        ? h("button", { class: "sc-btn sc-danger", text: S.streaming.stopping || S.streaming.recovering ? "保存中…" : "停止", disabled: Boolean(S.streaming.stopping || S.streaming.recovering), on: { click: stopMessage } })
+        : h("button", { class: "sc-btn sc-primary", text: S.sending ? "准备发送…" : "发送", disabled: S.sending, on: { click: guard(sendMessage) } }),
     ),
   );
 }
 
 function chatTab() {
   const turns = S.session?.turns ?? [];
-  const previous = S.host?.querySelector(".sc-messages");
-  const keepScroll = previous && !S.stickBottom ? previous.scrollTop : null;
   const messages = h(
     "div",
-    { class: "sc-messages" },
+    { class: "sc-messages", "data-ui-key": "messages" },
     !turns.length && !S.streaming ? h("div", { class: "sc-empty", text: "选好预设和模型服务，直接说想画什么。回复里的每张图都可以一键填入「Soda Chat 提示词」节点并出图。" }) : null,
-    turns.map((turn) => [userBlock(turn.user, turn.material), assistantBlock(turn)]),
-    S.streaming ? [userBlock(S.streaming.user, ""), streamingBlock()] : null,
+    turns.map((turn) => [userBlock(turn.user, turn.material, turn.images, turn.id), assistantBlock(turn)]),
+    S.streaming ? [userBlock(S.streaming.user, S.streaming.material, S.streaming.images, "streaming"), streamingBlock()] : null,
   );
-  requestAnimationFrame(() => {
-    messages.scrollTop = keepScroll ?? messages.scrollHeight;
-    S.stickBottom = false;
-  });
   const notice = S.noNode
     ? h(
         "div",
@@ -635,7 +969,7 @@ function chatTab() {
         "span",
         { class: "sc-row" },
         h("button", { class: "sc-btn", text: S.showHistory ? "收起历史" : "历史", on: { click: () => { S.showHistory = !S.showHistory; render(); } } }),
-        h("button", { class: "sc-btn", text: "新对话", on: { click: guard(newSession) } }),
+        h("button", { class: "sc-btn", text: "新对话", disabled: Boolean(S.streaming || S.sending), on: { click: guard(newSession) } }),
       ),
     ),
     S.showHistory ? historyPanel() : null,
@@ -643,6 +977,7 @@ function chatTab() {
     messages,
     composer(),
     S.preview ? previewOverlay() : null,
+    S.imagePicker ? imagePickerOverlay() : null,
   );
 }
 
@@ -669,23 +1004,101 @@ async function importPreset() {
   render();
 }
 
-async function openPreset(id) {
-  S.presetDetail = await call(`presets/${id}`);
+let presetOpenSerial = 0;
+let desiredPresetId = "";
+const presetToggleQueues = new Map();
+const presetEntryDrafts = new Map();
+const presetEntryVersions = new Map();
+
+function applyPresetEntryDrafts(detail) {
+  const drafts = presetEntryDrafts.get(detail.id);
+  for (const entry of detail.entries ?? []) {
+    if (drafts?.has(entry.id)) entry.enabled = drafts.get(entry.id).enabled;
+  }
+  return detail;
+}
+
+function showPresetUpdate(detail) {
+  applyPresetEntryDrafts(detail);
+  if (S.presetDetail?.id === detail.id && (!desiredPresetId || desiredPresetId === detail.id)) S.presetDetail = detail;
+  S.presets = S.presets.map((preset) => preset.id === detail.id ? {
+    ...preset, enabled_count: detail.entries.filter((entry) => entry.enabled).length,
+    entry_count: detail.entries.length,
+  } : preset);
   render();
+}
+
+async function openPreset(id) {
+  const serial = ++presetOpenSerial;
+  desiredPresetId = id;
+  try {
+    // Wait for already-clicked switches before loading the same preset again.
+    await (presetToggleQueues.get(id) ?? Promise.resolve()).catch(() => {});
+    const version = presetEntryVersions.get(id) ?? 0;
+    const detail = await call(`presets/${id}`);
+    if (serial !== presetOpenSerial) return;
+    if (version !== (presetEntryVersions.get(id) ?? 0)) return openPreset(id);
+    S.presetDetail = applyPresetEntryDrafts(detail);
+    render();
+  } catch (error) {
+    if (serial !== presetOpenSerial) return;
+    desiredPresetId = S.presetDetail?.id ?? "";
+    throw error;
+  }
 }
 
 async function togglePresetEntry(entry, enabled) {
-  S.presetDetail = await call(`presets/${S.presetDetail.id}`, { method: "PATCH", body: { entries: { [entry.id]: enabled } } });
-  S.presets = (await call("state")).presets;
-  render();
+  const id = S.presetDetail?.id;
+  if (!id) return;
+  if (!presetEntryDrafts.has(id)) presetEntryDrafts.set(id, new Map());
+  const drafts = presetEntryDrafts.get(id);
+  const edit = { enabled };
+  drafts.set(entry.id, edit);
+  presetEntryVersions.set(id, (presetEntryVersions.get(id) ?? 0) + 1);
+  entry.enabled = enabled;
+  const previous = presetToggleQueues.get(id) ?? Promise.resolve();
+  const pending = previous.catch(() => {}).then(async () => {
+    try {
+      const detail = await call(`presets/${id}`, { method: "PATCH", body: { entries: { [entry.id]: enabled } } });
+      if (drafts.get(entry.id) === edit) drafts.delete(entry.id);
+      showPresetUpdate(detail);
+    } catch (error) {
+      if (drafts.get(entry.id) === edit) drafts.delete(entry.id);
+      try { showPresetUpdate(await call(`presets/${id}`)); } catch { /* Keep the draft visible if the server is offline. */ }
+      throw error;
+    }
+  }).finally(() => {
+    if (presetToggleQueues.get(id) === pending) presetToggleQueues.delete(id);
+    if (!drafts.size) presetEntryDrafts.delete(id);
+  });
+  presetToggleQueues.set(id, pending);
+  return pending;
 }
 
-async function savePresetVariables(form) {
-  const overrides = {};
-  for (const input of form.querySelectorAll("input[data-var]")) {
-    if (input.value !== "") overrides[input.dataset.var] = input.value;
+function presetVariableValue(detail, variable) {
+  const draft = S.presetVariableDrafts.get(detail.id);
+  return draft?.has(variable.name) ? draft.get(variable.name) : variable.override ?? "";
+}
+
+function editPresetVariable(presetId, name, value) {
+  if (!S.presetVariableDrafts.has(presetId)) S.presetVariableDrafts.set(presetId, new Map());
+  S.presetVariableDrafts.get(presetId).set(name, value);
+}
+
+async function savePresetVariables(presetId) {
+  const detail = S.presetDetail;
+  if (!detail || detail.id !== presetId) return;
+  const snapshot = new Map(detail.variables.map((variable) => [variable.name, presetVariableValue(detail, variable)]));
+  const overrides = Object.fromEntries([...snapshot].filter(([, value]) => value !== ""));
+  const saved = await call(`presets/${presetId}`, { method: "PATCH", body: { overrides } });
+  if (S.presetDetail?.id === presetId && (!desiredPresetId || desiredPresetId === presetId)) S.presetDetail = applyPresetEntryDrafts(saved);
+  const draft = S.presetVariableDrafts.get(presetId);
+  if (draft) {
+    for (const [name, value] of snapshot) {
+      if (draft.get(name) === value) draft.delete(name);
+    }
+    if (!draft.size) S.presetVariableDrafts.delete(presetId);
   }
-  S.presetDetail = await call(`presets/${S.presetDetail.id}`, { method: "PATCH", body: { overrides } });
   toast("变量已保存", "success");
   render();
 }
@@ -700,15 +1113,16 @@ async function deletePreset() {
 }
 
 function entryRow(entry) {
-  const content = h("div", { class: "sc-pre" });
+  const content = h("div", { class: "sc-pre", "data-ui-key": "content" });
   return h(
     "details",
-    { class: `sc-entry${entry.enabled ? "" : " sc-off"}`, on: { toggle: (e) => { if (e.target.open && !content.textContent) content.textContent = entry.content || "（空）"; } } },
+    { class: `sc-entry${entry.enabled ? "" : " sc-off"}`, "data-ui-key": `entry:${entry.id}`, on: { toggle: (e) => { if (e.target.open && !content.textContent) content.textContent = entry.content || "（空）"; } } },
     h(
       "summary",
       {},
       h("input", {
         type: "checkbox",
+        "data-ui-key": "enabled",
         checked: entry.enabled,
         title: "启用",
         on: { click: (e) => e.stopPropagation(), change: guard((e) => togglePresetEntry(entry, e.target.checked)) },
@@ -732,7 +1146,11 @@ function presetDetail() {
         "label",
         { class: "sc-var" },
         h("span", { text: v.name }),
-        h("input", { class: "sc-field", "data-var": v.name, value: v.override ?? "", placeholder: v.default ?? "（未设置）" }),
+        h("input", {
+          class: "sc-field", "data-var": v.name, "data-ui-key": `preset-variable:${d.id}:${v.name}`,
+          value: presetVariableValue(d, v), placeholder: v.default ?? "（未设置）",
+          on: { input: (e) => editPresetVariable(d.id, v.name, e.target.value) },
+        }),
       ),
     ),
   );
@@ -750,7 +1168,7 @@ function presetDetail() {
     h("h4", { text: "变量" }),
     h("div", { class: "sc-muted", text: "留空 = 用预设里的默认值。改完点保存。" }),
     form,
-    d.variables.length ? h("button", { class: "sc-btn", text: "保存变量", on: { click: guard(() => savePresetVariables(form)) } }) : null,
+    d.variables.length ? h("button", { class: "sc-btn", text: "保存变量", on: { click: guard(() => savePresetVariables(d.id)) } }) : null,
     h("h4", { text: `条目（启用 ${d.entries.filter((e) => e.enabled).length} / ${d.entries.length}）` }),
     h("div", { class: "sc-muted", text: "勾选决定是否发送；点条目名查看内容。" }),
     d.entries.map(entryRow),
@@ -760,7 +1178,7 @@ function presetDetail() {
 function presetsTab() {
   return h(
     "div",
-    { class: "sc-scroll" },
+    { class: "sc-scroll", "data-ui-key": "scroll" },
     h("div", { class: "sc-row" }, h("button", { class: "sc-btn sc-primary", text: "导入预设 JSON", on: { click: guard(importPreset) } })),
     h("div", { class: "sc-muted", text: "支持 st-chatu8 的 LLM 预设格式。" }),
     h(
@@ -769,7 +1187,7 @@ function presetsTab() {
       S.presets.map((p) =>
         h(
           "button",
-          { class: `sc-list-item${S.presetDetail?.id === p.id ? " sc-active" : ""}`, on: { click: guard(() => openPreset(p.id)) } },
+          { class: `sc-list-item${S.presetDetail?.id === p.id ? " sc-active" : ""}`, "data-ui-key": `preset:${p.id}`, on: { click: guard(() => openPreset(p.id)) } },
           h("span", { text: p.name }),
           h("span", { class: "sc-muted", text: `${p.builtin ? "内置 · " : ""}${p.enabled_count}/${p.entry_count} 条${S.presetId === p.id ? " · 聊天中" : ""}` }),
         ),
@@ -786,23 +1204,86 @@ function blankCharacter() {
   return { name: "", aliases: [], kind: "specific", enabled: true, summary: "", front: side(), back: side() };
 }
 
+let characterLoadPromise = null;
+
 async function ensureCharacters() {
-  if (!S.characters) {
-    S.characters = (await call("characters")).characters;
-    render();
+  if (S.characters) return;
+  if (!characterLoadPromise) {
+    characterLoadPromise = call("characters").then(({ characters }) => {
+      if (!S.characters) {
+        S.characters = characters;
+        render();
+      }
+    }).finally(() => { characterLoadPromise = null; });
   }
+  return characterLoadPromise;
 }
+
+let characterSaveQueue = Promise.resolve();
+let characterSaveSerial = 0;
 
 async function saveCharacters() {
-  S.characters = (await call("characters", { method: "PUT", body: { characters: S.characters } })).characters;
-  toast("角色库已保存", "success");
-  render();
+  const source = S.characters;
+  const serialized = JSON.stringify(source);
+  const snapshot = JSON.parse(serialized);
+  const serial = ++characterSaveSerial;
+  const pending = characterSaveQueue.catch(() => {}).then(async () => {
+    const saved = (await call("characters", { method: "PUT", body: { characters: snapshot } })).characters;
+    if (serial !== characterSaveSerial) return;
+    if (S.characters === source && JSON.stringify(S.characters) === serialized && saved.length === source.length) {
+      // Keep object identities (including nested fields) stable for open cards and focus restoration.
+      saved.forEach((character, index) => {
+        const { front, back, ...fields } = character;
+        Object.assign(source[index], fields);
+        Object.assign(source[index].front, front);
+        Object.assign(source[index].back, back);
+      });
+      toast("角色库已保存", "success");
+    } else {
+      toast("已保存点击时的角色库；之后的编辑仍保留，请再点保存", "info");
+    }
+    render();
+  });
+  characterSaveQueue = pending;
+  return pending;
 }
 
+async function importCharactersData(data) {
+  const source = S.characters;
+  const baseline = JSON.stringify(source);
+  const snapshot = JSON.parse(JSON.stringify(data));
+  const serial = ++characterSaveSerial;
+  const pending = characterSaveQueue.catch(() => {}).then(async () => {
+    const saved = (await call("characters", { method: "PUT", body: snapshot })).characters;
+    if (serial !== characterSaveSerial) return;
+    if (S.characters === source && JSON.stringify(S.characters) === baseline) {
+      // Import intentionally replaces the library, so imported cards get new identities.
+      S.characters = saved;
+      toast("角色库已导入", "success");
+    } else {
+      toast("角色库已导入；页面上后续的编辑仍保留为未保存草稿", "info");
+    }
+    render();
+  });
+  characterSaveQueue = pending;
+  return pending;
+}
+
+async function importCharacters() {
+  const file = await pickFile();
+  if (!file) return;
+  await importCharactersData(JSON.parse(await file.text()));
+}
+
+const characterUIKeys = new WeakMap();
+let characterUISequence = 0;
+
 function characterCard(character, index) {
+  if (!characterUIKeys.has(character)) characterUIKeys.set(character, ++characterUISequence);
   const bind = (obj, key, props = {}) =>
     h(props.multiline ? "textarea" : "input", {
       class: "sc-field",
+      "data-ui-key": key,
       value: Array.isArray(obj[key]) ? obj[key].join("、") : obj[key],
       rows: props.multiline ? 2 : undefined,
       placeholder: props.placeholder,
@@ -810,7 +1291,7 @@ function characterCard(character, index) {
     });
   return h(
     "details",
-    { class: "sc-card", open: !character.name },
+    { class: "sc-card", "data-ui-key": `character:${characterUIKeys.get(character)}`, open: !character.name },
     h("summary", {}, h("strong", { text: character.name || "（新角色）" }), h("span", { class: "sc-muted", text: ` ${character.kind === "template" ? "通用模板" : "特定角色"}${character.enabled ? "" : " · 停用"}` })),
     h("label", { class: "sc-var" }, h("span", { text: "名字" }), bind(character, "name", { placeholder: "预设调用时用的名字，如 xiao hong" })),
     h("label", { class: "sc-var" }, h("span", { text: "别名" }), bind(character, "aliases", { placeholder: "用顿号或逗号分隔" })),
@@ -818,12 +1299,12 @@ function characterCard(character, index) {
     h(
       "div",
       { class: "sc-row" },
-      h("select", { class: "sc-select", on: { change: (e) => { character.kind = e.target.value; } } }, h("option", { value: "specific", text: "特定角色", selected: character.kind === "specific" }), h("option", { value: "template", text: "通用模板", selected: character.kind === "template" })),
-      h("label", { class: "sc-check" }, h("input", { type: "checkbox", checked: character.enabled, on: { change: (e) => { character.enabled = e.target.checked; } } }), "启用"),
+      h("select", { class: "sc-select", "data-ui-key": "kind", on: { change: (e) => { character.kind = e.target.value; } } }, h("option", { value: "specific", text: "特定角色", selected: character.kind === "specific" }), h("option", { value: "template", text: "通用模板", selected: character.kind === "template" })),
+      h("label", { class: "sc-check" }, h("input", { type: "checkbox", "data-ui-key": "enabled", checked: character.enabled, on: { change: (e) => { character.enabled = e.target.checked; } } }), "启用"),
       h("button", { class: "sc-btn sc-danger", text: "删除", on: { click: () => { S.characters.splice(index, 1); render(); } } }),
     ),
     Object.entries(SIDES).map(([side, label]) =>
-      h("details", { class: "sc-fold" }, h("summary", { text: `${label}字段` }), Object.entries(FIELDS).map(([key, name]) => h("label", { class: "sc-var" }, h("span", { text: name }), bind(character[side], key, { multiline: true, placeholder: side === "back" ? "留空则用正面" : "danbooru 标签＋一句英文" })))),
+      h("details", { class: "sc-fold", "data-ui-key": side }, h("summary", { text: `${label}字段` }), Object.entries(FIELDS).map(([key, name]) => h("label", { class: "sc-var" }, h("span", { text: name }), bind(character[side], key, { multiline: true, placeholder: side === "back" ? "留空则用正面" : "danbooru 标签＋一句英文" })))),
     ),
   );
 }
@@ -835,13 +1316,13 @@ function charactersTab() {
   }
   return h(
     "div",
-    { class: "sc-scroll" },
+    { class: "sc-scroll", "data-ui-key": "scroll" },
     h("div", { class: "sc-muted", text: "预设里的 ${\"name\":…}$ 调用会换成这里的字段：基础外貌＋按状态选的上半身、下半身；from behind 用背面字段。" }),
     h(
       "div",
       { class: "sc-row" },
       h("button", { class: "sc-btn", text: "新增角色", on: { click: () => { S.characters.unshift(blankCharacter()); render(); } } }),
-      h("button", { class: "sc-btn", text: "导入", on: { click: guard(async () => { const file = await pickFile(); if (!file) return; const data = JSON.parse(await file.text()); S.characters = (await call("characters", { method: "PUT", body: data })).characters; toast("角色库已导入", "success"); render(); }) } }),
+      h("button", { class: "sc-btn", text: "导入", on: { click: guard(importCharacters) } }),
       h("button", { class: "sc-btn", text: "导出", on: { click: () => download("soda-chat-characters.json", { characters: S.characters }) } }),
       h("button", { class: "sc-btn sc-primary", text: "保存", on: { click: guard(saveCharacters) } }),
     ),
@@ -879,6 +1360,23 @@ async function saveService() {
   render();
 }
 
+function chatSettingsValues() {
+  return { ...S.settings, ...S.settingsDraft };
+}
+
+async function saveChatSettings() {
+  const values = chatSettingsValues();
+  const keys = ["history_turns", "user_name", "char_name", "target_label", "use_ai_size"];
+  const body = Object.fromEntries(keys.map((key) => [key, values[key]]));
+  S.settings = await call("settings", { method: "PUT", body });
+  // Do not clear edits made while the save request was in flight.
+  for (const [key, value] of Object.entries(body)) {
+    if (S.settingsDraft[key] === value) delete S.settingsDraft[key];
+  }
+  toast("设置已保存", "success");
+  render();
+}
+
 function settingsTab() {
   const form = serviceForm();
   const field = (key, label, props = {}) =>
@@ -888,6 +1386,7 @@ function settingsTab() {
       h("span", { text: label }),
       h("input", {
         class: "sc-field",
+        "data-ui-key": `service-field:${form.id || "new"}:${key}`,
         type: props.type ?? "text",
         value: form[key] ?? "",
         placeholder: props.placeholder,
@@ -897,8 +1396,8 @@ function settingsTab() {
         on: { input: (e) => { form[key] = props.type === "number" ? Number(e.target.value) : e.target.value; } },
       }),
     );
-  const flag = (key, label) => h("label", { class: "sc-check" }, h("input", { type: "checkbox", checked: Boolean(form[key]), on: { change: (e) => { form[key] = e.target.checked; } } }), label);
-  const settings = { ...S.settings };
+  const flag = (key, label) => h("label", { class: "sc-check" }, h("input", { type: "checkbox", "data-ui-key": `service-field:${form.id || "new"}:${key}`, checked: Boolean(form[key]), on: { change: (e) => { form[key] = e.target.checked; } } }), label);
+  const settings = chatSettingsValues();
   const setting = (key, label, type = "text") =>
     h(
       "label",
@@ -906,16 +1405,17 @@ function settingsTab() {
       type === "checkbox" ? null : h("span", { text: label }),
       h("input", {
         class: type === "checkbox" ? undefined : "sc-field",
+        "data-ui-key": `settings:${key}`,
         type,
         value: type === "checkbox" ? undefined : settings[key],
         checked: type === "checkbox" ? settings[key] : undefined,
-        on: { input: (e) => { settings[key] = type === "checkbox" ? e.target.checked : type === "number" ? Number(e.target.value) : e.target.value; } },
+        on: { input: (e) => { S.settingsDraft[key] = type === "checkbox" ? e.target.checked : type === "number" ? Number(e.target.value) : e.target.value; } },
       }),
       type === "checkbox" ? label : null,
     );
   return h(
     "div",
-    { class: "sc-scroll" },
+    { class: "sc-scroll", "data-ui-key": "scroll" },
     h("h4", { text: "模型服务" }),
     h(
       "div",
@@ -941,7 +1441,7 @@ function settingsTab() {
       "div",
       { class: "sc-row" },
       h("button", { class: "sc-btn sc-primary", text: "保存", on: { click: guard(saveService) } }),
-      form.id && form.id !== S.services.active ? h("button", { class: "sc-btn", text: "设为当前", on: { click: guard(async () => { S.services = await call(`services/${form.id}/activate`, { method: "POST", body: {} }); render(); }) } }) : null,
+      form.id && form.id !== S.services.active ? h("button", { class: "sc-btn", text: "设为当前", on: { click: guard(() => selectService(form.id)) } }) : null,
       h("button", { class: "sc-btn", text: "测试连接", on: { click: guard(async () => { const r = await call("services/test", { method: "POST", body: formPayload(form) }); toast(`连接成功（${r.seconds} 秒）：${r.reply || "（空回复）"}`, "success"); }) } }),
       h("button", { class: "sc-btn", text: "拉取模型", on: { click: guard(async () => { S.modelOptions = (await call("services/models", { method: "POST", body: formPayload(form) })).models; toast(`拉到 ${S.modelOptions.length} 个模型，在「模型」框里选择`, "success"); render(); }) } }),
       form.id ? h("button", { class: "sc-btn sc-danger", text: "删除", on: { click: guard(async () => { if (!confirm(`删除服务「${form.name}」？`)) return; S.services = await call(`services/${form.id}`, { method: "DELETE" }); S.serviceForm = null; render(); }) } }) : null,
@@ -953,13 +1453,85 @@ function settingsTab() {
     setting("char_name", "{{char}} 名字"),
     setting("target_label", "目标节点 label（空 = 第一个）"),
     setting("use_ai_size", "使用 AI 给的尺寸", "checkbox"),
-    h("button", { class: "sc-btn", text: "保存设置", on: { click: guard(async () => { const { seeded_builtin: _s, ...body } = settings; S.settings = await call("settings", { method: "PUT", body }); toast("设置已保存", "success"); render(); }) } }),
+    h("button", { class: "sc-btn", text: "保存设置", on: { click: guard(saveChatSettings) } }),
   );
 }
 
 // ---- shell -----------------------------------------------------------------------------------------------
 
 const TABS = { chat: "聊天", presets: "预设", characters: "角色", settings: "设置" };
+const viewStates = new Map();
+const SCROLLERS = ".sc-scroll, .sc-messages, .sc-composer, .sc-history, .sc-dialog-body, .sc-attachments, .sc-pre, .sc-live, textarea";
+
+function viewKey() {
+  if (S.tab === "chat") return `chat:${S.session?.id || "new"}`;
+  if (S.tab === "presets") return `presets:${S.presetDetail?.id || "list"}`;
+  return S.tab;
+}
+
+function elementKey(element, root) {
+  const parts = [];
+  for (let item = element; item && item !== root; item = item.parentElement) {
+    if (item.dataset.uiKey) parts.unshift(item.dataset.uiKey);
+  }
+  return JSON.stringify(parts);
+}
+
+function captureView(root) {
+  const state = { details: new Map(), scroll: new Map(), focus: null };
+  for (const element of root.querySelectorAll("[data-ui-key]")) {
+    const key = elementKey(element, root);
+    if (element.tagName === "DETAILS") state.details.set(key, element.open);
+    if (element.matches(SCROLLERS)) {
+      const live = element.matches(".sc-messages") ? element.querySelector(".sc-live") : null;
+      state.scroll.set(key, {
+        top: element.scrollTop, left: element.scrollLeft,
+        follow: element.matches(".sc-messages, .sc-live")
+          && element.scrollHeight - element.scrollTop - element.clientHeight < (element.matches(".sc-live") ? 80 : 160)
+          && (!live || live.scrollHeight - live.scrollTop - live.clientHeight < 80),
+        height: element.tagName === "TEXTAREA" ? element.style.height : "",
+      });
+    }
+    if (element === document.activeElement) {
+      state.focus = { key, start: element.selectionStart, end: element.selectionEnd, direction: element.selectionDirection };
+    }
+  }
+  return state;
+}
+
+function restoreView(root, state, restoreFocus, bottom) {
+  const elements = new Map([...root.querySelectorAll("[data-ui-key]")].map((element) => [elementKey(element, root), element]));
+  // Expand first: restoring offsets against collapsed content would clamp them to zero.
+  for (const [key, open] of state?.details ?? []) {
+    const element = elements.get(key);
+    if (!element) continue;
+    element.open = open;
+    // Preset contents are lazy. Native toggle is asynchronous, so populate before layout.
+    if (open) element.dispatchEvent(new Event("toggle"));
+  }
+  for (const [key, position] of state?.scroll ?? []) {
+    const element = elements.get(key);
+    if (element && position.height) element.style.height = position.height;
+  }
+  if (restoreFocus && state?.focus) {
+    const { key, start, end, direction } = state.focus;
+    const element = elements.get(key);
+    if (element && !element.disabled) {
+      element.focus({ preventScroll: true });
+      if (start != null && typeof element.setSelectionRange === "function") {
+        try { element.setSelectionRange(start, end, direction); } catch { /* number inputs have no text selection */ }
+      }
+    }
+  }
+  for (const [key, position] of state?.scroll ?? []) {
+    const element = elements.get(key);
+    if (!element) continue;
+    element.scrollLeft = position.left;
+    element.scrollTop = position.follow ? element.scrollHeight : position.top;
+  }
+  const messages = root.querySelector(".sc-messages");
+  if (messages && (bottom || !state)) messages.scrollTop = messages.scrollHeight;
+}
 
 function switchTab(key) {
   S.tab = key;
@@ -967,10 +1539,12 @@ function switchTab(key) {
   render();
   if (key === "presets" || key === "chat") {
     // Presets may have been imported elsewhere (another browser tab or the API).
-    guard(async () => {
+    const serviceSerial = S.serviceSwitchSerial;
+    const switching = Boolean(S.serviceSwitchPending);
+    return guard(async () => {
       const data = await call("state");
       S.presets = data.presets;
-      S.services = data.services;
+      if (!switching && !S.serviceSwitchPending && serviceSerial === S.serviceSwitchSerial) S.services = data.services;
       render();
     })();
   }
@@ -979,29 +1553,39 @@ function switchTab(key) {
 function render() {
   const host = S.host;
   if (!host) return;
+  const previous = host.querySelector(".soda-chat[data-ui-view]");
+  if (previous) {
+    viewStates.delete(previous.dataset.uiView);
+    viewStates.set(previous.dataset.uiView, captureView(previous));
+    // Keep navigation state bounded even across many old conversations.
+    if (viewStates.size > 30) viewStates.delete(viewStates.keys().next().value);
+  }
   if (!S.ready) {
     host.replaceChildren(h("div", { class: "soda-chat" }, h("div", { class: "sc-muted", text: "Soda Chat 读取中…" })));
     return;
   }
+  const key = viewKey();
   const body = { chat: chatTab, presets: presetsTab, characters: charactersTab, settings: settingsTab }[S.tab] ?? chatTab;
-  host.replaceChildren(
+  const root = h(
+    "div",
+    {
+      class: "soda-chat",
+      "data-ui-view": key,
+      // Keep typing inside the panel from reaching ComfyUI shortcuts (Ctrl+Enter queues the workflow).
+      on: { keydown: (e) => { if (e.target.matches?.("input, textarea, select")) e.stopPropagation(); } },
+    },
     h(
       "div",
-      {
-        class: "soda-chat",
-        // Keep typing inside the panel from reaching ComfyUI shortcuts (Ctrl+Enter queues the workflow).
-        on: { keydown: (e) => { if (e.target.matches?.("input, textarea, select")) e.stopPropagation(); } },
-      },
-      h(
-        "div",
-        { class: "sc-tabs" },
-        Object.entries(TABS).map(([key, label]) =>
-          h("button", { class: `sc-tab${S.tab === key ? " sc-active" : ""}`, text: label, on: { click: () => switchTab(key) } }),
-        ),
+      { class: "sc-tabs" },
+      Object.entries(TABS).map(([key, label]) =>
+        h("button", { class: `sc-tab${S.tab === key ? " sc-active" : ""}`, text: label, on: { click: () => switchTab(key) } }),
       ),
-      body(),
     ),
+    body(),
   );
+  host.replaceChildren(root);
+  restoreView(root, viewStates.get(key), previous?.dataset.uiView === key, S.stickBottom);
+  if (S.tab === "chat") S.stickBottom = false;
 }
 
 function mount(element) {
