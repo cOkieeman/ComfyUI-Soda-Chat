@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -20,6 +24,41 @@ REPLY = [
     "一下</thinking>好的。\n<images><image><title_styled>猫</title_styled>",
     "<size>832x1216</size><prompts>[Tags]\n1girl, cat</prompts></image></images>",
 ]
+
+
+def test_concurrent_first_requests_share_one_context(
+    plugin: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workers = 6
+    barrier = Barrier(workers)
+    created = []
+    folder_paths = SimpleNamespace(
+        get_user_directory=lambda: str(tmp_path / "user"),
+        get_output_directory=lambda: str(tmp_path / "output"),
+        get_temp_directory=lambda: str(tmp_path / "temp"),
+    )
+    original_import = plugin.routes.importlib.import_module
+
+    def fake_import(name: str) -> Any:
+        return folder_paths if name == "folder_paths" else original_import(name)
+
+    def create_context(_cls: type, _root: Path, **_options: Any) -> Any:
+        time.sleep(0.03)  # Simulate slow disk setup after all request workers have entered.
+        context = SimpleNamespace()
+        created.append(context)
+        return context
+
+    def first_request(_index: int) -> Any:
+        barrier.wait(timeout=2)
+        return plugin.routes.default_context()
+
+    monkeypatch.setattr(plugin.routes, "_CONTEXT", None)
+    monkeypatch.setattr(plugin.routes.importlib, "import_module", fake_import)
+    monkeypatch.setattr(plugin.routes.Context, "create", classmethod(create_context))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        contexts = list(executor.map(first_request, range(workers)))
+    assert len(created) == 1
+    assert all(context is contexts[0] for context in contexts)
 
 
 def upstream_app(fail: int = 0) -> web.Application:
@@ -273,3 +312,108 @@ def test_client_disconnect_saves_interrupted_turn(plugin: ModuleType, tmp_path: 
     assert turn["status"] == "interrupted"
     assert set(turn["reply"].split()) <= {"piece"}  # whatever arrived before the disconnect
     assert len(turn["reply"]) < len("piece ") * 40
+
+
+async def stopped_before_first_token(
+    plugin: ModuleType, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> dict[str, Any]:
+    closed = asyncio.Event()
+    never = asyncio.Event()
+
+    async def waiting_stream(_profile: dict, _messages: list[dict]) -> Any:
+        try:
+            await never.wait()
+            yield "content", "should not arrive"
+        finally:
+            closed.set()
+
+    monkeypatch.setattr(plugin.routes, "stream_chat", waiting_stream)
+    monkeypatch.setattr(plugin.routes, "HEARTBEAT_SECONDS", 0.02)
+    ctx = plugin.routes.Context.create(root, ROOT / "presets_builtin")
+    ctx.services.save("", {"base_url": "http://127.0.0.1:1/v1", "model": "waiting"})
+    app = web.Application()
+    for method, path, handler in plugin.routes.route_table(lambda: ctx):
+        app.router.add_route(method.upper(), path, handler)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.post(
+            "/soda_chat/chat", json={"preset_id": ctx.presets.list()[0]["id"], "input": "停止等待"}
+        )
+        first = (await response.content.readany()).decode()
+        start = json.loads(first.split("data: ", 1)[1].split("\n", 1)[0])
+        response.close()
+        await asyncio.wait_for(closed.wait(), timeout=1)
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            try:
+                session = ctx.sessions.get(start["session_id"])
+            except KeyError:
+                continue
+            if session["turns"]:
+                return {"start": start, "turn": session["turns"][-1]}
+        return {}
+    finally:
+        await client.close()
+
+
+def test_stop_before_first_token_cancels_upstream_and_saves_exact_turn(
+    plugin: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = asyncio.run(stopped_before_first_token(plugin, tmp_path, monkeypatch))
+    assert result["turn"]["id"] == result["start"]["turn_id"]
+    assert result["turn"]["status"] == "interrupted"
+    assert result["turn"]["reply"] == ""
+
+
+async def deleted_while_streaming(
+    plugin: ModuleType, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> dict[str, Any]:
+    waiting = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_stream(_profile: dict, _messages: list[dict]) -> Any:
+        yield "content", "first part "
+        waiting.set()
+        await release.wait()
+        yield "content", "last part"
+
+    monkeypatch.setattr(plugin.routes, "stream_chat", delayed_stream)
+    ctx = plugin.routes.Context.create(root, ROOT / "presets_builtin")
+    ctx.services.save("", {"base_url": "http://127.0.0.1:1/v1", "model": "waiting"})
+    session = ctx.sessions.get_or_create("", "existing")
+    ctx.sessions.append(session, {"id": "before", "time": "2026-01-01", "user": "old", "reply": "old"})
+    app = web.Application()
+    for method, path, handler in plugin.routes.route_table(lambda: ctx):
+        app.router.add_route(method.upper(), path, handler)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.post(
+            "/soda_chat/chat",
+            json={"session_id": session["id"], "preset_id": ctx.presets.list()[0]["id"], "input": "continue"},
+        )
+        await asyncio.wait_for(waiting.wait(), timeout=1)
+        deleted = await client.delete(f"/soda_chat/sessions/{session['id']}")
+        assert deleted.status == 200
+        release.set()
+        result = events(await response.text())
+        missing = await client.get(f"/soda_chat/sessions/{session['id']}")
+        return {"events": result, "sessions": ctx.sessions.list(), "missing": missing.status}
+    finally:
+        release.set()
+        await client.close()
+
+
+def test_deleted_inflight_conversation_returns_clear_error_without_revival(
+    plugin: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = asyncio.run(deleted_while_streaming(plugin, tmp_path, monkeypatch))
+    event, terminal = result["events"][-1]
+    assert event == "error"
+    assert terminal["session_deleted"] is True
+    assert terminal["turn"]["status"] == "error"
+    assert "已在其他窗口删除" in terminal["error"]
+    assert "请新建对话" in terminal["error"]
+    assert result["sessions"] == []
+    assert result["missing"] == 404

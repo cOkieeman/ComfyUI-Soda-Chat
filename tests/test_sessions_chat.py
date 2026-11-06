@@ -43,6 +43,58 @@ def test_sessions_roundtrip(tmp_path: Path) -> None:
         store.get(session["id"])
 
 
+def test_card_edits_are_used_by_next_turn_and_survive_an_older_stream(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path)
+    session = store.get_or_create("", "画猫")
+    store.append(
+        session, turn("画猫", "<thinking>secret thought</thinking><image><prompts>old cat</prompts></image>")
+    )
+    older_stream = store.get(session["id"])
+    store.update_prompt(session["id"], "t1", 0, "new smaller cat")
+    store.append(older_stream, turn("继续", "完成", "t2"))
+    current = store.get(session["id"])
+    assert len(current["turns"]) == 2
+    assert current["turns"][0]["parsed"]["images"][0]["prompt"] == "new smaller cat"
+    context = context_text(current, 5)
+    assert "new smaller cat" in context
+    assert "old cat" not in context
+    assert "secret thought" not in context
+
+
+@pytest.mark.parametrize("index", [-1, 1, 99, True, "0"])
+def test_prompt_update_rejects_invalid_card_index(tmp_path: Path, index: int) -> None:
+    store = SessionStore(tmp_path)
+    session = store.get_or_create("", "画猫")
+    store.append(session, turn("画猫", "<image><prompts>cat</prompts></image>"))
+    with pytest.raises(ValueError, match="提示词卡片"):
+        store.update_prompt(session["id"], "t1", index, "edited")
+
+
+def test_parallel_session_snapshots_do_not_overwrite_other_turns(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path)
+    session = store.get_or_create("", "第一轮")
+    store.append(session, turn("第一轮", "一", "t1"))
+    first_snapshot = store.get(session["id"])
+    second_snapshot = store.get(session["id"])
+    store.append(first_snapshot, turn("第二轮", "二", "t2"))
+    store.append(second_snapshot, turn("第三轮", "三", "t3"))
+    assert [item["id"] for item in store.get(session["id"])["turns"]] == ["t1", "t2", "t3"]
+
+
+def test_deleted_conversation_is_not_revived_by_a_pending_stream(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path)
+    session = store.get_or_create("", "第一轮")
+    store.append(session, turn("第一轮", "一", "t1"))
+    pending = store.get(session["id"])
+    store.delete(session["id"])
+    saved = store.append(pending, turn("第二轮", "迟到的回复", "t2"))
+    assert store.list() == []
+    assert saved is False
+    fresh = store.get_or_create("", "新的对话")
+    assert store.append(fresh, turn("新的对话", "可以保存", "new")) is True
+    assert store.get(fresh["id"])["turns"][0]["reply"] == "可以保存"
+
+
 def test_context_text_limits_turns_and_strips_thinking() -> None:
     session = {"turns": [turn("一", "<thinking>想</thinking>答一"), turn("二", "答二"), turn("三", "答三")]}
     assert context_text(session, 2) == "用户：二\n\n助手：答二\n\n用户：三\n\n助手：答三"

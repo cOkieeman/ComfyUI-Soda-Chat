@@ -6,13 +6,16 @@ import asyncio
 import importlib
 import ipaddress
 import json
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from aiohttp import web
 
+from .soda_chat.attachments import AttachmentStore, attach_images
 from .soda_chat.characters import CharacterStore
 from .soda_chat.chat import SettingsStore, build_messages, parse_turn
 from .soda_chat.llm import LLMError, list_models, stream_chat, test_connection
@@ -22,7 +25,7 @@ from .soda_chat.sessions import SessionStore, now
 from .soda_chat.storage import new_id
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable
 
     Handler = Callable[["Context", web.Request, dict[str, Any]], Awaitable[Any]]
 
@@ -30,8 +33,10 @@ BUILTIN_DIR = Path(__file__).resolve().parent / "presets_builtin"
 MAX_BODY = 1024 * 1024
 MAX_IMPORT_BODY = 7 * 1024 * 1024
 MAX_INPUT = 200_000
+HEARTBEAT_SECONDS = 1
 _REGISTERED = False
 _CONTEXT: Context | None = None
+_CONTEXT_LOCK = Lock()
 
 
 @dataclass
@@ -42,9 +47,12 @@ class Context:
     characters: CharacterStore
     sessions: SessionStore
     settings: SettingsStore
+    attachments: AttachmentStore
 
     @classmethod
-    def create(cls, root: Path, builtin_dir: Path = BUILTIN_DIR) -> Context:
+    def create(
+        cls, root: Path, builtin_dir: Path = BUILTIN_DIR, *, image_roots: dict[str, Path] | None = None
+    ) -> Context:
         context = cls(
             root,
             PresetStore(root),
@@ -52,6 +60,7 @@ class Context:
             CharacterStore(root),
             SessionStore(root),
             SettingsStore(root),
+            AttachmentStore(root, image_roots),
         )
         seeded = list(context.settings.load()["seeded_builtin"])
         before = len(seeded)
@@ -68,8 +77,16 @@ class Context:
 def default_context() -> Context:
     global _CONTEXT  # noqa: PLW0603 -- created once, after ComfyUI knows its user directory
     if _CONTEXT is None:
-        folder_paths = importlib.import_module("folder_paths")
-        _CONTEXT = Context.create(Path(folder_paths.get_user_directory()) / "soda_chat")
+        with _CONTEXT_LOCK:
+            if _CONTEXT is None:
+                folder_paths = importlib.import_module("folder_paths")
+                _CONTEXT = Context.create(
+                    Path(folder_paths.get_user_directory()) / "soda_chat",
+                    image_roots={
+                        "output": Path(folder_paths.get_output_directory()),
+                        "temp": Path(folder_paths.get_temp_directory()),
+                    },
+                )
     return _CONTEXT
 
 
@@ -232,6 +249,10 @@ async def session_prompt(ctx: Context, request: web.Request, body: dict[str, Any
     return {"ok": True}
 
 
+async def attachment_from_output(ctx: Context, _request: web.Request, body: dict[str, Any]) -> Any:
+    return {"attachment": await asyncio.to_thread(ctx.attachments.from_output, body)}
+
+
 def _turn_inputs(ctx: Context, body: dict[str, Any]) -> tuple[dict, dict, dict, dict, dict, dict]:
     request = {key: _text(body, key) for key in ("input", "material", "setting")}
     if not request["input"].strip() and not request["material"].strip():
@@ -241,6 +262,7 @@ def _turn_inputs(ctx: Context, body: dict[str, Any]) -> tuple[dict, dict, dict, 
     session = ctx.sessions.get_or_create(
         _text(body, "session_id", 64), request["input"] or request["material"]
     )
+    request["images"] = ctx.attachments.selected(body.get("image_ids", []))
     return request, preset, profile, session, ctx.characters.load(), ctx.settings.load()
 
 
@@ -249,7 +271,9 @@ async def preview(ctx: Context, _request: web.Request, body: dict[str, Any]) -> 
     messages, report = build_messages(
         preset, session, request, library=library, settings=settings, profile=profile
     )
-    return {"messages": messages, "report": report}
+    images = request["images"]
+    messages = attach_images(messages, images, [image["url"] for image in images])
+    return {"messages": messages, "report": report, "images": images}
 
 
 ROUTES: list[tuple[str, str, Handler, int]] = [
@@ -272,6 +296,7 @@ ROUTES: list[tuple[str, str, Handler, int]] = [
     ("get", "sessions/{session_id}", session_get, MAX_BODY),
     ("delete", "sessions/{session_id}", session_delete, MAX_BODY),
     ("patch", "sessions/{session_id}/prompt", session_prompt, MAX_BODY),
+    ("post", "attachments/from-output", attachment_from_output, MAX_BODY),
     ("post", "preview", preview, MAX_BODY),
 ]
 
@@ -307,24 +332,61 @@ def chat_handler(get_context: Callable[[], Context]) -> Any:
             messages, report = build_messages(
                 preset, session, user, library=library, settings=settings, profile=profile
             )
+            urls = await asyncio.to_thread(
+                lambda: [ctx.attachments.data_url(image["id"]) for image in user["images"]]
+            )
+            messages = attach_images(messages, user["images"], urls)
         except (KeyError, FileNotFoundError) as exc:
             return web.json_response({"error": _message(exc)}, status=404)
         except (ValueError, TypeError) as exc:
             return web.json_response({"error": _message(exc)}, status=400)
+        except OSError:
+            return web.json_response({"error": "读取图片或对话失败，请重新选择图片后重试"}, status=500)
         return await run_chat(request, ctx, user, preset, profile, session, library, messages, report)
 
     return wrapped
 
 
+async def _with_heartbeats(stream: AsyncIterator[tuple[str, str]]) -> AsyncIterator[tuple[str, str]]:
+    """Notice a disconnected client even while the upstream has not sent its first token."""
+    pending = asyncio.create_task(anext(stream))
+    try:
+        while True:
+            ready, _ = await asyncio.wait({pending}, timeout=HEARTBEAT_SECONDS)
+            if not ready:
+                yield "heartbeat", ""
+                continue
+            try:
+                piece = pending.result()
+            except StopAsyncIteration:
+                return
+            yield piece
+            pending = asyncio.create_task(anext(stream))
+    finally:
+        if not pending.done():
+            pending.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending
+
+
+async def _persist_turn(ctx: Context, session: dict[str, Any], turn: dict[str, Any]) -> bool:
+    saved = await asyncio.to_thread(ctx.sessions.append, session, turn)
+    if not saved and turn["status"] != "interrupted":
+        turn.update(
+            status="error", error="这段对话已在其他窗口删除，本轮回复未保存。请新建对话后重试。"
+        )
+    return saved
+
+
 async def run_chat(  # noqa: PLR0913, PLR0917 -- one turn needs all of these
     request: web.Request,
     ctx: Context,
-    user: dict[str, str],
+    user: dict[str, Any],
     preset: dict[str, Any],
     profile: dict[str, Any],
     session: dict[str, Any],
     library: dict[str, Any],
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     report: dict[str, Any],
 ) -> web.StreamResponse:
     response = web.StreamResponse(
@@ -339,11 +401,19 @@ async def run_chat(  # noqa: PLR0913, PLR0917 -- one turn needs all of these
     content: list[str] = []
     reasoning: list[str] = []
     status, error = "ok", ""
+    turn_id = new_id()
     stream = stream_chat(profile, messages)
+    pieces = _with_heartbeats(stream)
     cancelled = False
     try:
-        await send("start", {"session_id": session["id"], "title": session["title"], "report": report})
-        async for kind, piece in stream:
+        await send(
+            "start",
+            {"session_id": session["id"], "turn_id": turn_id, "title": session["title"], "report": report},
+        )
+        async for kind, piece in pieces:
+            if kind == "heartbeat":
+                await send("ping", {})
+                continue
             (content if kind == "content" else reasoning).append(piece)
             await send("delta", {"kind": kind, "text": piece})
     except LLMError as exc:
@@ -353,14 +423,16 @@ async def run_chat(  # noqa: PLR0913, PLR0917 -- one turn needs all of these
     except asyncio.CancelledError:
         status, cancelled = "interrupted", True
     finally:
+        await pieces.aclose()
         await stream.aclose()
     reply = "".join(content)
     turn = {
-        "id": new_id(),
+        "id": turn_id,
         "time": now(),
         "user": user["input"],
         "material": user["material"],
         "setting": user["setting"],
+        "images": user["images"],
         "preset_id": preset["id"],
         "preset_name": preset["name"],
         "service_name": profile.get("name", ""),
@@ -372,21 +444,51 @@ async def run_chat(  # noqa: PLR0913, PLR0917 -- one turn needs all of these
         "error": error,
         "report": report,
     }
-    await asyncio.to_thread(ctx.sessions.append, session, turn)
+    saved = await _persist_turn(ctx, session, turn)
+    status, error = turn["status"], turn["error"]
     if cancelled:
         raise asyncio.CancelledError
     if status != "interrupted":
         try:
-            await send("done" if status == "ok" else "error", {"turn": turn, "error": error})
+            await send(
+                "done" if status == "ok" else "error",
+                {"turn": turn, "error": error, "session_deleted": not saved},
+            )
             await response.write_eof()
         except ConnectionResetError:
             pass
     return response
 
 
+def attachment_handler(get_context: Callable[[], Context]) -> Any:
+    async def wrapped(request: web.Request) -> web.Response:
+        if not allowed_request(request.remote or "", request.host, request.headers.get("Origin")):
+            return web.json_response({"error": "Soda Chat 只接受本机同源请求"}, status=403)
+        try:
+            ctx = await asyncio.to_thread(get_context)
+            attachment_id = request.match_info["attachment_id"]
+            ctx.attachments.get(attachment_id)
+            path = ctx.attachments.path(attachment_id)
+            data = await asyncio.to_thread(path.read_bytes)
+            return web.Response(
+                body=data,
+                content_type="image/jpeg",
+                headers={"Cache-Control": "private, max-age=86400", "X-Content-Type-Options": "nosniff"},
+            )
+        except (KeyError, FileNotFoundError) as exc:
+            return web.json_response({"error": _message(exc)}, status=404)
+        except (TypeError, ValueError) as exc:
+            return web.json_response({"error": _message(exc)}, status=400)
+        except OSError:
+            return web.json_response({"error": "读取图片失败"}, status=500)
+
+    return wrapped
+
+
 def route_table(get_context: Callable[[], Context]) -> list[tuple[str, str, Any]]:
     table = [(m, f"/soda_chat/{p}", json_handler(h, limit, get_context)) for m, p, h, limit in ROUTES]
     table.append(("post", "/soda_chat/chat", chat_handler(get_context)))
+    table.append(("get", "/soda_chat/attachments/{attachment_id}", attachment_handler(get_context)))
     return table
 
 

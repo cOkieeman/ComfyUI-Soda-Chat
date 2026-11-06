@@ -53,7 +53,7 @@ class SettingsStore:
 
 
 def placeholders(
-    request: dict[str, str], session: dict[str, Any], library: dict[str, Any], settings: dict[str, Any]
+    request: dict[str, Any], session: dict[str, Any], library: dict[str, Any], settings: dict[str, Any]
 ) -> dict[str, str]:
     user_input, material = request.get("input", ""), request.get("material", "")
     return {
@@ -72,7 +72,7 @@ def placeholders(
 def build_messages(  # noqa: PLR0913 -- one turn needs all of these
     preset: dict[str, Any],
     session: dict[str, Any],
-    request: dict[str, str],
+    request: dict[str, Any],
     *,
     library: dict[str, Any],
     settings: dict[str, Any],

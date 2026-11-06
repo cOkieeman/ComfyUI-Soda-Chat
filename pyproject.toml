@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-soda-chat"
-version = "0.1.0"
+version = "0.1.1"
 description = "Chat with an LLM in the ComfyUI sidebar, write image prompts with st-chatu8 style presets, then fill a node and queue the workflow in one click."
 requires-python = ">=3.12"
 license = { file = "LICENSE" }
@@ -16,7 +16,12 @@ Icon = ""
 includes = []
 
 [dependency-groups]
-dev = ["pytest>=8.0", "ruff>=0.9", "aiohttp>=3.9"]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.9",
+    "aiohttp>=3.9",
+    "pillow>=10.0",
+]
 
 [tool.ruff]
 line-length = 110
